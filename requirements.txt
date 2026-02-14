@@ -4,3 +4,5 @@ numpy
 torch
 soundfile
 qwen-tts
+sounddevice
+requests
