@@ -18,56 +18,7 @@ import numpy as np
 import torch
 import soundfile as sf
 from qwen_tts import Qwen3TTSModel
-
-
-def split_text(text: str, max_chars: int = 50) -> List[str]:
-    """
-    テキストを句点位置で分割
-    
-    Args:
-        text: 分割するテキスト
-        max_chars: 1チャンクの目安文字数
-    
-    Returns:
-        分割されたテキストのリスト
-    """
-    # 句点パターン（日本語と英語の句読点）
-    sentence_end_pattern = r'[。！？\.!?]'
-    
-    chunks = []
-    current_chunk = ""
-    
-    # 文単位で分割
-    sentences = re.split(f'({sentence_end_pattern})', text)
-    
-    # 句読点を前の文に結合
-    merged_sentences = []
-    for i in range(0, len(sentences), 2):
-        if i + 1 < len(sentences):
-            merged_sentences.append(sentences[i] + sentences[i + 1])
-        elif sentences[i].strip():
-            merged_sentences.append(sentences[i])
-    
-    # max_chars前後でチャンク化
-    for sentence in merged_sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-        
-        # 現在のチャンクに追加できるか
-        if len(current_chunk) + len(sentence) <= max_chars:
-            current_chunk += sentence
-        else:
-            # 現在のチャンクを保存して新しいチャンクを開始
-            if current_chunk:
-                chunks.append(current_chunk)
-            current_chunk = sentence
-    
-    # 最後のチャンク
-    if current_chunk:
-        chunks.append(current_chunk)
-    
-    return chunks
+from streaming_tts import split_text  # streaming_tts.pyから関数をインポート
 
 
 def main():
@@ -99,7 +50,8 @@ def main():
     
     # 2. テキスト分割
     print(f"\n📝 テキスト分割中...")
-    chunks = split_text(sample_text, max_chars=50)
+    chunks_with_type = split_text(sample_text, max_chars=50)
+    chunks = [text for text, _ in chunks_with_type]  # テキストのみ抽出
     print(f"   全体: {len(sample_text)}文字 -> {len(chunks)}チャンクに分割")
     for i, chunk in enumerate(chunks):
         print(f"   [{i+1}] ({len(chunk):2d}文字) {chunk[:40]}...")

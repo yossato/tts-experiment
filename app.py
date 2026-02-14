@@ -72,7 +72,8 @@ def generate_speech(
     start_time = time.time()
     
     # テキスト分割
-    chunks = split_text(text, max_chars=max_chars)
+    chunks_with_type = split_text(text, max_chars=max_chars)
+    chunks = [text for text, _ in chunks_with_type]  # テキストのみ抽出
     
     # バッチ音声生成
     generation_start = time.time()
@@ -769,9 +770,9 @@ async def text_to_speech_streaming(
         async with generation_lock:
             print("✅ ロック取得成功、生成開始")
             try:
-                # テキスト分割
-                chunks = split_text(text, max_chars=max_chars)
-                total_chunks = len(chunks)
+                # テキスト分割（文末タイプ付き）
+                chunks_with_type = split_text(text, max_chars=max_chars)
+                total_chunks = len(chunks_with_type)
                 print(f"📝 分割完了: {total_chunks}チャンク")
                 
                 # 初期情報を送信
@@ -781,25 +782,34 @@ async def text_to_speech_streaming(
                 
                 # バッチごとに処理
                 for i in range(0, total_chunks, batch_size):
-                    batch_chunks = chunks[i:i + batch_size]
+                    batch_chunks_with_type = chunks_with_type[i:i + batch_size]
+                    batch_texts = [text for text, _ in batch_chunks_with_type]
                     batch_num = i // batch_size + 1
                     print(f"🎤 バッチ {batch_num} 生成中...")
                     
                     # バッチ生成
                     wavs, sr = model.generate_custom_voice(
-                        text=batch_chunks,
-                        language=[language] * len(batch_chunks),
-                        speaker=[speaker] * len(batch_chunks),
+                        text=batch_texts,
+                        language=[language] * len(batch_texts),
+                        speaker=[speaker] * len(batch_texts),
                     )
                     print(f"✓ バッチ {batch_num} 生成完了")
                     
                     # 各チャンクを送信
                     for j, wav in enumerate(wavs):
                         chunk_idx = i + j
+                        chunk_text, end_type = batch_chunks_with_type[j]
                         duration = len(wav) / sr
                         
-                        # チャンク間に0.5秒の無音を追加
-                        silence = np.zeros(int(sr * 0.5), dtype=wav.dtype)
+                        # 文末タイプに応じて無音の長さを変える
+                        if end_type == "period":
+                            # 句点: 0.5秒の無音
+                            silence_duration = 0.5
+                        else:
+                            # 読点: 無音なし
+                            silence_duration = 0.0
+                        
+                        silence = np.zeros(int(sr * silence_duration), dtype=wav.dtype)
                         wav_with_silence = np.concatenate([wav, silence])
                         
                         # WAVファイルとしてエンコード
@@ -812,9 +822,10 @@ async def text_to_speech_streaming(
                             'type': 'chunk',
                             'index': chunk_idx,
                             'total': total_chunks,
-                            'text': batch_chunks[j],
+                            'text': chunk_text,
                             'duration': duration,
-                            'audio': audio_base64
+                            'audio': audio_base64,
+                            'end_type': end_type
                         }
                         yield f"data: {json.dumps(chunk_data)}\n\n"
                         

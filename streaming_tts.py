@@ -26,18 +26,20 @@ except ImportError:
     print("   インストール: pip install sounddevice")
 
 
-def split_text(text: str, max_chars: int = 50) -> List[str]:
+def split_text(text: str, max_chars: int = 50) -> List[tuple[str, str]]:
     """
-    テキストを句点位置で分割
+    テキストを句点・読点位置で分割
     
     Args:
         text: 分割するテキスト
         max_chars: 1チャンクの目安文字数
     
     Returns:
-        分割されたテキストのリスト
+        (テキスト, 文末タイプ)のリスト
+        文末タイプ: "period" (句点), "comma" (読点)
     """
-    sentence_end_pattern = r'[。！？\.!?]'
+    # 句点（長い無音）と読点（短い無音）を区別
+    sentence_end_pattern = r'[。！？\.!?、,]'
     
     chunks = []
     current_chunk = ""
@@ -47,24 +49,33 @@ def split_text(text: str, max_chars: int = 50) -> List[str]:
     merged_sentences = []
     for i in range(0, len(sentences), 2):
         if i + 1 < len(sentences):
-            merged_sentences.append(sentences[i] + sentences[i + 1])
+            merged_sentences.append((sentences[i] + sentences[i + 1], sentences[i + 1]))
         elif sentences[i].strip():
-            merged_sentences.append(sentences[i])
+            merged_sentences.append((sentences[i], ""))
     
-    for sentence in merged_sentences:
+    for sentence, end_char in merged_sentences:
         sentence = sentence.strip()
         if not sentence:
             continue
+        
+        # 文末タイプを判定
+        end_type = "comma" if end_char in ['、', ','] else "period"
         
         if len(current_chunk) + len(sentence) <= max_chars:
             current_chunk += sentence
         else:
             if current_chunk:
-                chunks.append(current_chunk)
+                chunks.append((current_chunk, end_type))
             current_chunk = sentence
     
     if current_chunk:
-        chunks.append(current_chunk)
+        # 最後のチャンクの文末タイプを判定
+        if merged_sentences:
+            _, last_end = merged_sentences[-1]
+            end_type = "comma" if last_end in ['、', ','] else "period"
+        else:
+            end_type = "period"
+        chunks.append((current_chunk, end_type))
     
     return chunks
 
@@ -273,7 +284,8 @@ class StreamingTTSGenerator:
         
         # テキスト分割
         print(f"\n📝 テキスト分割中...")
-        chunks = split_text(text, max_chars=max_chars)
+        chunks_with_type = split_text(text, max_chars=max_chars)
+        chunks = [text for text, _ in chunks_with_type]  # テキストのみ抽出
         print(f"   全体: {len(text)}文字 → {len(chunks)}チャンクに分割")
         print(f"   バッチ処理: {self.batch_size}チャンクずつ生成\n")
         
