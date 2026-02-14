@@ -114,14 +114,10 @@ class TTSPlayerApp(rumps.App):
             self.is_paused = False
             self.pause_item.title = "Pause"
             self._set_title_safe(f"TTS {self.current_chunk}/{self.total_chunks}")
-            if self.stream:
-                self.stream.start()
         else:
             self.is_paused = True
             self.pause_item.title = "Resume"
             self._set_title_safe("TTS (paused)")
-            if self.stream:
-                self.stream.stop()
 
     def stop_playback(self, _):
         self.is_stopped = True
@@ -232,30 +228,82 @@ class TTSPlayerApp(rumps.App):
             print(f"[ERROR] Failed to decode audio: {e}", file=sys.stderr, flush=True)
 
     def _playback_worker(self):
-        """キューから音声を取り出して順番に再生"""
+        """キューから音声を取り出して順番に再生（ストリーミング）"""
         print(f"[DEBUG] Playback worker started", file=sys.stderr, flush=True)
         played = 0
+        
+        def callback(outdata, frames, time_info, status):
+            """sounddeviceのコールバック - 再生データを供給"""
+            if status:
+                print(f"[DEBUG] Playback status: {status}", file=sys.stderr, flush=True)
+            
+            # Pause中はサイレンスを出力
+            if self.is_paused:
+                outdata[:] = 0
+                return
+            
+            # 現在の音声データがない、または再生位置が終端に達した場合
+            if self.current_audio is None or self.play_position >= len(self.current_audio):
+                outdata[:] = 0
+                return
+            
+            # 残りのサンプル数を計算
+            remaining = len(self.current_audio) - self.play_position
+            to_read = min(frames, remaining)
+            
+            # データをコピー
+            outdata[:to_read] = self.current_audio[self.play_position:self.play_position + to_read].reshape(-1, 1)
+            if to_read < frames:
+                outdata[to_read:] = 0
+            
+            self.play_position += to_read
+        
+        # OutputStreamを開始
+        try:
+            self.stream = sd.OutputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                callback=callback,
+                blocksize=2048
+            )
+            self.stream.start()
+        except Exception as e:
+            print(f"[ERROR] Failed to open audio stream: {e}", file=sys.stderr, flush=True)
+            return
+        
         while not self.is_stopped:
-            self.playback_event.wait(timeout=1.0)
+            self.playback_event.wait(timeout=0.5)
             self.playback_event.clear()
 
             while not self.is_stopped:
+                # 新しいチャンクがあるか確認
                 with self.queue_lock:
                     if played >= len(self.audio_queue):
                         break
                     audio = self.audio_queue[played]
 
-                # ブロッキング再生
+                # チャンクを設定して再生開始
                 try:
                     print(f"[DEBUG] Playing chunk #{played + 1}, shape: {audio.shape}", file=sys.stderr, flush=True)
-                    sd.play(audio, samplerate=self.sample_rate)
-                    while sd.get_stream().active:
-                        if self.is_stopped:
-                            print(f"[DEBUG] Playback stopped", file=sys.stderr, flush=True)
-                            sd.stop()
-                            return
-                        time.sleep(0.05)
-                    sd.wait()
+                    self.current_audio = audio
+                    self.play_position = 0
+                    
+                    # 再生完了まで待機（Pause/Stop対応）
+                    while self.play_position < len(self.current_audio) and not self.is_stopped:
+                        if not self.is_paused:
+                            # 再生中は短い間隔でチェック
+                            time.sleep(0.1)
+                        else:
+                            # Pause中は少し長めに
+                            time.sleep(0.2)
+                    
+                    if self.is_stopped:
+                        print(f"[DEBUG] Playback stopped", file=sys.stderr, flush=True)
+                        if self.stream:
+                            self.stream.stop()
+                            self.stream.close()
+                        return
+                    
                     print(f"[DEBUG] Chunk #{played + 1} finished", file=sys.stderr, flush=True)
                 except Exception as e:
                     print(f"[ERROR] Playback error: {e}", file=sys.stderr, flush=True)
@@ -268,6 +316,9 @@ class TTSPlayerApp(rumps.App):
             if self.sse_done.is_set() and played >= len(self.audio_queue):
                 print(f"[DEBUG] All chunks played, exiting", file=sys.stderr, flush=True)
                 self._set_title_safe("TTS (done)")
+                if self.stream:
+                    self.stream.stop()
+                    self.stream.close()
                 threading.Timer(1.0, self._quit).start()
                 return
 
