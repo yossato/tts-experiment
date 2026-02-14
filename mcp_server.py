@@ -24,15 +24,49 @@ audio_library_serverのAPIを呼び出して音声生成を行う。
 """
 
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+
+def resolve_server_url(url: str) -> str:
+    """URLのホスト名をIPアドレスに解決する。
+
+    mDNS (.local) などMCPサブプロセスから解決できないホスト名を
+    起動時にIPアドレスへ変換しておく。
+    """
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        return url
+
+    try:
+        ip = socket.getaddrinfo(hostname, None, socket.AF_INET)[0][4][0]
+    except socket.gaierror:
+        # 解決できなければ元のURLをそのまま返す
+        return url
+
+    # ホスト名をIPに置換（ポート付きの場合も考慮）
+    if parsed.port:
+        new_netloc = f"{ip}:{parsed.port}"
+    else:
+        new_netloc = ip
+
+    resolved = urlunparse(parsed._replace(netloc=new_netloc))
+    if resolved != url:
+        print(f"Resolved {hostname} -> {ip}", file=sys.stderr)
+    return resolved
+
+
 # サーバー設定
-TTS_SERVER_URL = os.environ.get("TTS_SERVER_URL", "http://localhost:8001")
+TTS_SERVER_URL = resolve_server_url(
+    os.environ.get("TTS_SERVER_URL", "http://localhost:8001")
+)
 PLAYER_SCRIPT = str(Path(__file__).parent / "tts_player.py")
 
 mcp = FastMCP("tts")
