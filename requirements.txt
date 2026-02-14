@@ -6,3 +6,6 @@ soundfile
 qwen-tts
 sounddevice
 requests
+fastmcp
+httpx
+rumps

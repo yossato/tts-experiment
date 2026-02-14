@@ -9,11 +9,11 @@ audio_library_serverのAPIを呼び出して音声生成を行う。
   - read_aloud: テキストを即座に読み上げ（メニューバープレイヤーで再生）
   - generate_audio: テキストを音声化してサーバーに保存（後から再生）
 
-設定例 (~/.claude/claude_code_config.json):
+設定例 (.mcp.json):
 {
   "mcpServers": {
     "tts": {
-      "command": "python",
+      "command": "/path/to/venv/bin/python",
       "args": ["/path/to/mcp_server.py"],
       "env": {
         "TTS_SERVER_URL": "http://<ubuntu-ip>:8001"
@@ -53,7 +53,9 @@ async def read_aloud(
         language: Language (Japanese, English, Chinese)
         title: Optional title for the audio entry
     """
-    # tts_player.pyをサブプロセスとして起動
+    # デバッグ用ログファイル
+    log_file = Path(__file__).parent / "tts_player_debug.log"
+    
     cmd = [
         sys.executable, PLAYER_SCRIPT,
         "--server", TTS_SERVER_URL,
@@ -65,20 +67,32 @@ async def read_aloud(
         cmd.extend(["--title", title])
 
     try:
-        subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
+        # デバッグ: エラーログをファイルに出力
+        with open(log_file, "w") as log:
+            process = subprocess.Popen(
+                cmd,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        
+        # プロセスが即座に終了していないか確認
+        import time
+        time.sleep(0.5)
+        if process.poll() is not None:
+            # プロセスが終了している場合、ログを読む
+            with open(log_file, "r") as log:
+                error_msg = log.read()
+            return f"Player process exited immediately (code: {process.returncode}).\nLog:\n{error_msg}\nCheck {log_file} for details."
     except Exception as e:
-        return f"Failed to start player: {e}"
+        return f"Failed to start player: {e}\nCommand: {' '.join(cmd)}"
 
     preview = text[:80] + "..." if len(text) > 80 else text
     return (
         f"Playback started. Control via menu bar icon.\n"
         f"Text: {preview}\n"
-        f"Speaker: {speaker}, Language: {language}"
+        f"Speaker: {speaker}, Language: {language}\n"
+        f"Debug log: {log_file}"
     )
 
 

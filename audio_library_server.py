@@ -15,6 +15,7 @@ import uuid
 import base64
 import asyncio
 import json
+import functools
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -22,7 +23,7 @@ from typing import Optional
 import numpy as np
 import torch
 import soundfile as sf
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse, JSONResponse
 from pydantic import BaseModel
 from qwen_tts import Qwen3TTSModel
@@ -32,6 +33,7 @@ from streaming_tts import split_text
 # --- モデル・設定 ---
 
 LIBRARY_DIR = Path(__file__).parent / "audio_library"
+TEMP_DIR = Path(__file__).parent / "temp_chunks"
 METADATA_FILE = LIBRARY_DIR / "metadata.json"
 SAMPLE_RATE = 24000
 
@@ -176,6 +178,7 @@ async def generate(request: GenerateRequest):
 
 @app.get("/api/generate/streaming")
 async def generate_streaming(
+    request: Request,
     text: str,
     title: Optional[str] = None,
     speaker: str = "Ono_Anna",
@@ -187,96 +190,161 @@ async def generate_streaming(
     """SSEストリーミング生成 → ライブラリに保存"""
     entry_id = str(uuid.uuid4())[:8] if save else None
 
+    # ストリーム用の一時ディレクトリ
+    stream_id = str(uuid.uuid4())[:8]
+    stream_dir = TEMP_DIR / stream_id
+    stream_dir.mkdir(parents=True, exist_ok=True)
+
     async def generate_stream():
-        async with generation_lock:
-            try:
-                chunks_with_type = split_text(text, max_chars=max_chars)
-                total_chunks = len(chunks_with_type)
+        try:
+            disconnected = False
+            chunks_with_type = split_text(text, max_chars=max_chars)
+            total_chunks = len(chunks_with_type)
 
-                init_data = {"type": "init", "total_chunks": total_chunks, "sample_rate": SAMPLE_RATE}
-                if entry_id:
-                    init_data["entry_id"] = entry_id
-                yield f"data: {json.dumps(init_data)}\n\n"
-                await asyncio.sleep(0.1)
+            init_data = {"type": "init", "total_chunks": total_chunks, "sample_rate": SAMPLE_RATE}
+            if entry_id:
+                init_data["entry_id"] = entry_id
+            yield f"data: {json.dumps(init_data)}\n\n"
 
-                all_wavs = []
+            all_wavs = []
 
-                for i in range(0, total_chunks, batch_size):
-                    batch_chunks = chunks_with_type[i:i + batch_size]
-                    batch_texts = [t for t, _ in batch_chunks]
+            for i in range(0, total_chunks, batch_size):
+                is_disc = await request.is_disconnected()
+                print(f"[DEBUG] Batch {i}, is_disconnected={is_disc}")
+                if is_disc:
+                    print(f"[WARNING] Client disconnected, stopping early")
+                    disconnected = True
+                    break
 
-                    wavs, sr = model.generate_custom_voice(
-                        text=batch_texts,
-                        language=[language] * len(batch_texts),
-                        speaker=[speaker] * len(batch_texts),
+                batch_chunks = chunks_with_type[i:i + batch_size]
+                batch_texts = [t for t, _ in batch_chunks]
+
+                t0 = datetime.now()
+                print(f"[DEBUG] [{t0.strftime('%H:%M:%S.%f')[:-3]}] Generating {len(batch_texts)} chunks...")
+                loop = asyncio.get_event_loop()
+                async with generation_lock:
+                    wavs, sr = await loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            model.generate_custom_voice,
+                            text=batch_texts,
+                            language=[language] * len(batch_texts),
+                            speaker=[speaker] * len(batch_texts),
+                        )
                     )
+                t1 = datetime.now()
+                print(f"[DEBUG] [{t1.strftime('%H:%M:%S.%f')[:-3]}] Generated {len(wavs)} chunks (took {(t1-t0).total_seconds():.2f}s)")
 
-                    for j, wav in enumerate(wavs):
-                        chunk_idx = i + j
-                        chunk_text, end_type = batch_chunks[j]
-                        duration = len(wav) / sr
+                for j, wav in enumerate(wavs):
+                    is_disc = await request.is_disconnected()
+                    if is_disc:
+                        print(f"[WARNING] Client disconnected, stopping stream")
+                        disconnected = True
+                        break
 
-                        if end_type == "period":
-                            silence = np.zeros(int(sr * 1.0), dtype=wav.dtype)
-                            wav_with_silence = np.concatenate([wav, silence])
-                        else:
-                            wav_with_silence = wav
+                    chunk_idx = i + j
+                    chunk_text, end_type = batch_chunks[j]
+                    duration = len(wav) / sr
 
-                        if save:
-                            all_wavs.append(wav_with_silence)
+                    if end_type == "period":
+                        silence = np.zeros(int(sr * 1.0), dtype=wav.dtype)
+                        wav_with_silence = np.concatenate([wav, silence])
+                    else:
+                        wav_with_silence = wav
 
-                        # Base64エンコードして送信
-                        buffer = io.BytesIO()
-                        sf.write(buffer, wav_with_silence, sr, format="WAV")
-                        audio_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                    if save:
+                        all_wavs.append(wav_with_silence)
 
-                        chunk_data = {
-                            "type": "chunk",
-                            "index": chunk_idx,
-                            "total": total_chunks,
-                            "text": chunk_text,
-                            "duration": duration,
-                            "audio": audio_b64,
-                            "end_type": end_type,
-                        }
-                        yield f"data: {json.dumps(chunk_data)}\n\n"
-                        await asyncio.sleep(0.1)
+                    # 一時ファイルとして保存
+                    chunk_file = stream_dir / f"{chunk_idx}.wav"
+                    sf.write(str(chunk_file), wav_with_silence, sr, format="WAV")
+                    audio_url = f"/api/temp/{stream_id}/{chunk_idx}.wav"
 
-                # ライブラリに保存
-                if save and all_wavs:
-                    combined = np.concatenate(all_wavs)
-                    total_duration = len(combined) / sr
-                    save_audio(entry_id, combined, sr)
-                    add_entry({
-                        "id": entry_id,
-                        "title": title or text[:50],
-                        "text": text,
-                        "speaker": speaker,
-                        "language": language,
-                        "duration": round(total_duration, 1),
-                        "created_at": datetime.now().isoformat(),
-                    })
+                    # SSEでは軽量なメタデータ+URLのみ送信
+                    chunk_data = {
+                        "type": "chunk",
+                        "index": chunk_idx,
+                        "total": total_chunks,
+                        "text": chunk_text,
+                        "duration": duration,
+                        "end_type": end_type,
+                        "audio_url": audio_url,
+                    }
+                    t_yield = datetime.now()
+                    print(f"[DEBUG] [{t_yield.strftime('%H:%M:%S.%f')[:-3]}] Yielding chunk {chunk_idx} (URL: {audio_url})")
+                    yield f"data: {json.dumps(chunk_data)}\n\n"
+                    t_done = datetime.now()
+                    print(f"[DEBUG] [{t_done.strftime('%H:%M:%S.%f')[:-3]}] Chunk {chunk_idx} sent")
 
+                if disconnected:
+                    break
+
+            # ライブラリに保存
+            if save and all_wavs and not disconnected:
+                combined = np.concatenate(all_wavs)
+                total_duration = len(combined) / sr
+                save_audio(entry_id, combined, sr)
+                add_entry({
+                    "id": entry_id,
+                    "title": title or text[:50],
+                    "text": text,
+                    "speaker": speaker,
+                    "language": language,
+                    "duration": round(total_duration, 1),
+                    "created_at": datetime.now().isoformat(),
+                })
+
+            if not disconnected:
                 complete_data = {"type": "complete"}
                 if entry_id:
                     complete_data["entry_id"] = entry_id
                 yield f"data: {json.dumps(complete_data)}\n\n"
+            else:
+                print(f"[INFO] Stream terminated due to client disconnect")
 
-            except asyncio.CancelledError:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception as e:
-                error_data = {"type": "error", "message": str(e)}
-                yield f"data: {json.dumps(error_data)}\n\n"
-            finally:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+        except asyncio.CancelledError:
+            print(f"[WARNING] Task cancelled, cleaning up")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise
+        except Exception as e:
+            print(f"[ERROR] Exception in generate_stream: {e}")
+            import traceback
+            traceback.print_exc()
+            error_data = {"type": "error", "message": str(e)}
+            yield f"data: {json.dumps(error_data)}\n\n"
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"[INFO] GPU resources cleaned up")
+            # 一時ファイルを遅延削除（クライアントがダウンロードする時間を確保）
+            asyncio.get_event_loop().call_later(60, _cleanup_temp, stream_dir)
 
     return StreamingResponse(
         generate_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
+
+def _cleanup_temp(path: Path):
+    """一時ファイルのクリーンアップ"""
+    import shutil
+    try:
+        if path.exists():
+            shutil.rmtree(path)
+            print(f"[INFO] Cleaned up temp dir: {path}")
+    except Exception as e:
+        print(f"[WARNING] Failed to cleanup {path}: {e}")
+
+
+@app.get("/api/temp/{stream_id}/{filename}")
+async def get_temp_audio(stream_id: str, filename: str):
+    """一時チャンクファイルの配信"""
+    path = TEMP_DIR / stream_id / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Temp audio not found")
+    return FileResponse(path, media_type="audio/wav")
 
 
 @app.get("/api/library")
