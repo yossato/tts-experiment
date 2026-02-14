@@ -38,6 +38,19 @@ except ImportError:
     print("Error: httpx is required. Install with: pip install httpx")
     sys.exit(1)
 
+# Optional: librosa for high-quality time stretching
+try:
+    import librosa
+    HAS_LIBROSA = True
+except ImportError:
+    HAS_LIBROSA = False
+    # Fallback to scipy for simple resampling
+    try:
+        from scipy import signal
+        HAS_SCIPY = True
+    except ImportError:
+        HAS_SCIPY = False
+
 
 class TTSPlayerApp(rumps.App):
     def __init__(self, server_url: str, text: str, speaker: str = "Ono_Anna",
@@ -60,6 +73,7 @@ class TTSPlayerApp(rumps.App):
         # 再生状態
         self.is_paused = False
         self.is_stopped = False
+        self.playback_speed = 1.0  # 再生速度 (0.5 - 2.0)
         self.audio_queue: list[np.ndarray] = []
         self.queue_lock = threading.Lock()
         self.current_chunk = 0
@@ -81,7 +95,21 @@ class TTSPlayerApp(rumps.App):
         self.text_item.set_callback(None)
         self.pause_item = rumps.MenuItem("Pause", callback=self.toggle_pause)
         self.stop_item = rumps.MenuItem("Stop", callback=self.stop_playback)
-        self.menu = [self.text_item, None, self.pause_item, self.stop_item]
+        
+        # 速度選択サブメニュー
+        speed_menu = [
+            rumps.MenuItem("0.5x", callback=lambda _: self.set_speed(0.5)),
+            rumps.MenuItem("0.75x", callback=lambda _: self.set_speed(0.75)),
+            rumps.MenuItem("1.0x (Normal)", callback=lambda _: self.set_speed(1.0)),
+            rumps.MenuItem("1.25x", callback=lambda _: self.set_speed(1.25)),
+            rumps.MenuItem("1.5x", callback=lambda _: self.set_speed(1.5)),
+            rumps.MenuItem("2.0x", callback=lambda _: self.set_speed(2.0)),
+        ]
+        self.speed_item = rumps.MenuItem("Speed", callback=None)
+        for item in speed_menu:
+            self.speed_item.add(item)
+        
+        self.menu = [self.text_item, None, self.pause_item, self.stop_item, None, self.speed_item]
 
         # SSE受信・再生スレッドを__init__で開始（ready()はサブプロセスから呼ばれない場合がある）
         self.sse_done = threading.Event()
@@ -128,6 +156,13 @@ class TTSPlayerApp(rumps.App):
         self._set_title_safe("TTS (stopped)")
         # 少し待ってからアプリ終了
         threading.Timer(1.0, self._quit).start()
+
+    def set_speed(self, speed: float):
+        """再生速度を設定"""
+        self.playback_speed = speed
+        print(f"[DEBUG] Playback speed set to {speed}x", file=sys.stderr, flush=True)
+        if not self.is_paused and not self.is_stopped:
+            self._set_title_safe(f"TTS {self.current_chunk}/{self.total_chunks} ({speed}x)")
 
     def _quit(self):
         rumps.quit_application()
@@ -198,11 +233,13 @@ class TTSPlayerApp(rumps.App):
                     resp.raise_for_status()
                     audio_data, sr = sf.read(io.BytesIO(resp.content), dtype="float32")
                     print(f"[DEBUG] Downloaded chunk {idx}: {len(resp.content)} bytes -> shape {audio_data.shape}", file=sys.stderr, flush=True)
+                    
                     with self.queue_lock:
                         self.audio_queue.append(audio_data)
                     self.playback_event.set()
                     self.current_chunk = idx + 1
-                    self._set_title_safe(f"TTS {self.current_chunk}/{self.total_chunks}")
+                    speed_suffix = f" ({self.playback_speed}x)" if self.playback_speed != 1.0 else ""
+                    self._set_title_safe(f"TTS {self.current_chunk}/{self.total_chunks}{speed_suffix}")
                 except Exception as e:
                     print(f"[ERROR] Failed to download chunk {idx}: {e}", file=sys.stderr, flush=True)
         elif event_type == "complete":
@@ -219,13 +256,43 @@ class TTSPlayerApp(rumps.App):
             audio_bytes = base64.b64decode(audio_b64)
             audio_data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
             print(f"[DEBUG] Decoded audio: {len(audio_bytes)} bytes -> shape {audio_data.shape}, sr={sr}", file=sys.stderr, flush=True)
+            
             with self.queue_lock:
                 self.audio_queue.append(audio_data)
             self.playback_event.set()
             self.current_chunk = index + 1
-            self._set_title_safe(f"TTS {self.current_chunk}/{self.total_chunks}")
+            speed_suffix = f" ({self.playback_speed}x)" if self.playback_speed != 1.0 else ""
+            self._set_title_safe(f"TTS {self.current_chunk}/{self.total_chunks}{speed_suffix}")
         except Exception as e:
             print(f"[ERROR] Failed to decode audio: {e}", file=sys.stderr, flush=True)
+
+    def _apply_speed_change(self, audio_data: np.ndarray, sr: int) -> np.ndarray:
+        """音声データに速度変更を適用"""
+        if self.playback_speed == 1.0:
+            return audio_data
+        
+        rate = self.playback_speed
+        
+        # librosaがあればpitch-preserving time stretchを使用（高品質）
+        if HAS_LIBROSA:
+            try:
+                # librosa.effects.time_stretchはrate > 1で高速化、rate < 1で低速化
+                return librosa.effects.time_stretch(audio_data, rate=rate)
+            except Exception as e:
+                print(f"[WARN] librosa time_stretch failed: {e}, falling back to resampling", file=sys.stderr, flush=True)
+        
+        # scipyでシンプルなリサンプリング（pitchも変わる）
+        if HAS_SCIPY:
+            try:
+                from scipy import signal
+                new_length = int(len(audio_data) / rate)
+                return signal.resample(audio_data, new_length)
+            except Exception as e:
+                print(f"[WARN] scipy resample failed: {e}, using original audio", file=sys.stderr, flush=True)
+        
+        # どちらもなければ元のまま
+        print(f"[WARN] No speed change library available, using original audio", file=sys.stderr, flush=True)
+        return audio_data
 
     def _playback_worker(self):
         """キューから音声を取り出して順番に再生（ストリーミング）"""
@@ -284,6 +351,11 @@ class TTSPlayerApp(rumps.App):
 
                 # チャンクを設定して再生開始
                 try:
+                    # 速度変更を再生時に適用
+                    if self.playback_speed != 1.0:
+                        audio = self._apply_speed_change(audio, self.sample_rate)
+                        print(f"[DEBUG] Applied speed {self.playback_speed}x to chunk #{played + 1}, new shape: {audio.shape}", file=sys.stderr, flush=True)
+                    
                     print(f"[DEBUG] Playing chunk #{played + 1}, shape: {audio.shape}", file=sys.stderr, flush=True)
                     self.current_audio = audio
                     self.play_position = 0
