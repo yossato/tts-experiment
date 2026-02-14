@@ -11,6 +11,9 @@ Simple Batch TTS Server with FastAPI and Web UI
 import io
 import time
 import re
+import base64
+import asyncio
+import json
 from typing import List
 from pathlib import Path
 
@@ -22,6 +25,7 @@ from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from qwen_tts import Qwen3TTSModel
+from streaming_tts import split_text
 
 
 # リクエストモデル
@@ -32,58 +36,16 @@ class TTSRequest(BaseModel):
     max_chars: int = 50
 
 
+class TTSStreamingRequest(BaseModel):
+    text: str
+    speaker: str = "Ono_Anna"
+    language: str = "Japanese"
+    max_chars: int = 50
+    batch_size: int = 10
+
+
 # グローバル変数でモデルを保持
 model = None
-
-
-def split_text(text: str, max_chars: int = 50) -> List[str]:
-    """
-    テキストを句点位置で分割（simple_batch_tts.pyから流用）
-    
-    Args:
-        text: 分割するテキスト
-        max_chars: 1チャンクの目安文字数
-    
-    Returns:
-        分割されたテキストのリスト
-    """
-    # 句点パターン（日本語と英語の句読点）
-    sentence_end_pattern = r'[。！？\.!?]'
-    
-    chunks = []
-    current_chunk = ""
-    
-    # 文単位で分割
-    sentences = re.split(f'({sentence_end_pattern})', text)
-    
-    # 句読点を前の文に結合
-    merged_sentences = []
-    for i in range(0, len(sentences), 2):
-        if i + 1 < len(sentences):
-            merged_sentences.append(sentences[i] + sentences[i + 1])
-        elif sentences[i].strip():
-            merged_sentences.append(sentences[i])
-    
-    # max_chars前後でチャンク化
-    for sentence in merged_sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-        
-        # 現在のチャンクに追加できるか
-        if len(current_chunk) + len(sentence) <= max_chars:
-            current_chunk += sentence
-        else:
-            # 現在のチャンクを保存して新しいチャンクを開始
-            if current_chunk:
-                chunks.append(current_chunk)
-            current_chunk = sentence
-    
-    # 最後のチャンク
-    if current_chunk:
-        chunks.append(current_chunk)
-    
-    return chunks
 
 
 def generate_speech(
@@ -143,6 +105,9 @@ def generate_speech(
 
 # FastAPIアプリケーション
 app = FastAPI(title="Simple Batch TTS Server", version="1.0.0")
+
+# モデル生成のロック（同時実行を防ぐ）
+generation_lock = asyncio.Lock()
 
 # 静的ファイル（CSS/JS）を提供
 static_dir = Path(__file__).parent / "static"
@@ -401,7 +366,10 @@ async def index():
                 </select>
             </div>
             
-            <button type="submit" id="submitBtn">音声生成</button>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                <button type="submit" id="submitBtn">通常生成</button>
+                <button type="button" id="streamBtn" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">ストリーミング生成</button>
+            </div>
         </form>
         
         <div class="loading" id="loading">
@@ -420,17 +388,107 @@ async def index():
                 <div class="stats-grid" id="statsGrid"></div>
             </div>
         </div>
+        
+        <div class="audio-player" id="streamingPlayer" style="display: none;">
+            <h3 style="color: #333; margin-bottom: 10px;">🔄 ストリーミング再生</h3>
+            <div id="streamProgress" style="margin-bottom: 15px;">
+                <div style="background: #e0e0e0; height: 8px; border-radius: 4px; overflow: hidden;">
+                    <div id="progressBar" style="background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); height: 100%; width: 0%; transition: width 0.3s;"></div>
+                </div>
+                <p id="progressText" style="margin-top: 8px; color: #666; font-size: 14px;">準備中...</p>
+            </div>
+            <div id="chunkList" style="max-height: 200px; overflow-y: auto; background: white; padding: 10px; border-radius: 8px; margin-bottom: 15px;"></div>
+            <button id="stopStreamBtn" style="background: #dc3545;" disabled>ストリーミング停止</button>
+        </div>
     </div>
     
     <script>
         const form = document.getElementById('ttsForm');
         const submitBtn = document.getElementById('submitBtn');
+        const streamBtn = document.getElementById('streamBtn');
         const loading = document.getElementById('loading');
         const audioPlayer = document.getElementById('audioPlayer');
         const audioElement = document.getElementById('audioElement');
         const statsGrid = document.getElementById('statsGrid');
         const errorDiv = document.getElementById('error');
+        const streamingPlayer = document.getElementById('streamingPlayer');
+        const progressBar = document.getElementById('progressBar');
+        const progressText = document.getElementById('progressText');
+        const chunkList = document.getElementById('chunkList');
+        const stopStreamBtn = document.getElementById('stopStreamBtn');
         
+        let audioContext = null;
+        let currentSource = null;
+        let audioQueue = [];
+        let isPlaying = false;
+        let eventSource = null;
+        
+        // Web Audio API初期化
+        function initAudioContext() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+        }
+        
+        // 音声チャンクをキューに追加して再生
+        async function playAudioChunk(base64Audio) {
+            initAudioContext();
+            
+            // Base64デコード
+            const binaryString = atob(base64Audio);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            
+            // AudioBufferにデコード
+            const audioBuffer = await audioContext.decodeAudioData(bytes.buffer);
+            audioQueue.push(audioBuffer);
+            
+            // 再生中でなければ再生開始
+            if (!isPlaying) {
+                playNext();
+            }
+        }
+        
+        // キューから次の音声を再生
+        function playNext() {
+            if (audioQueue.length === 0) {
+                isPlaying = false;
+                return;
+            }
+            
+            isPlaying = true;
+            const audioBuffer = audioQueue.shift();
+            
+            currentSource = audioContext.createBufferSource();
+            currentSource.buffer = audioBuffer;
+            currentSource.connect(audioContext.destination);
+            
+            currentSource.onended = () => {
+                playNext();
+            };
+            
+            currentSource.start(0);
+        }
+        
+        // ストリーミング停止
+        function stopStreaming() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            if (currentSource) {
+                currentSource.stop();
+                currentSource = null;
+            }
+            audioQueue = [];
+            isPlaying = false;
+            streamBtn.disabled = false;
+            stopStreamBtn.disabled = true;
+        }
+        
+        // 通常の音声生成
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
             
@@ -442,6 +500,7 @@ async def index():
             submitBtn.disabled = true;
             loading.classList.add('show');
             audioPlayer.classList.remove('show');
+            streamingPlayer.style.display = 'none';
             errorDiv.classList.remove('show');
             
             try {
@@ -510,6 +569,130 @@ async def index():
                 loading.classList.remove('show');
             }
         });
+        
+        // ストリーミング生成
+        streamBtn.addEventListener('click', async () => {
+            const text = document.getElementById('text').value;
+            const speaker = document.getElementById('speaker').value;
+            const language = document.getElementById('language').value;
+            
+            if (!text) {
+                errorDiv.textContent = 'テキストを入力してください';
+                errorDiv.classList.add('show');
+                return;
+            }
+            
+            // 既存の接続をクリーンアップ
+            if (eventSource) {
+                console.log('既存のEventSourceを閉じます');
+                eventSource.close();
+                eventSource = null;
+            }
+            
+            // UIリセット
+            streamBtn.disabled = true;
+            stopStreamBtn.disabled = false;
+            audioPlayer.classList.remove('show');
+            streamingPlayer.style.display = 'block';
+            errorDiv.classList.remove('show');
+            chunkList.innerHTML = '';
+            progressBar.style.width = '0%';
+            progressText.textContent = '準備中...';
+            
+            // AudioContext初期化
+            initAudioContext();
+            audioQueue = [];
+            isPlaying = false;
+            
+            let totalChunks = 0;
+            let processedChunks = 0;
+            let hasReceivedData = false;
+            
+            try {
+                // Server-Sent Events接続
+                const params = new URLSearchParams({
+                    text: text,
+                    speaker: speaker,
+                    language: language,
+                    max_chars: '50',
+                    batch_size: '10'
+                });
+                console.log('EventSource接続開始:', '/api/tts/streaming?' + params.toString());
+                eventSource = new EventSource('/api/tts/streaming?' + params.toString());
+                
+                eventSource.onopen = (event) => {
+                    console.log('EventSource接続確立');
+                };
+                
+                eventSource.onmessage = async (event) => {
+                    hasReceivedData = true;
+                    console.log('SSEメッセージ受信:', event.data.substring(0, 100) + '...');
+                    const data = JSON.parse(event.data);
+                    
+                    if (data.type === 'init') {
+                        totalChunks = data.total_chunks;
+                        progressText.textContent = `合計 ${totalChunks} チャンク`;
+                        console.log(`初期化: ${totalChunks}チャンク`);
+                    } else if (data.type === 'chunk') {
+                        processedChunks++;
+                        const progress = (processedChunks / totalChunks) * 100;
+                        progressBar.style.width = `${progress}%`;
+                        progressText.textContent = `${processedChunks} / ${totalChunks} チャンク (${progress.toFixed(0)}%)`;
+                        
+                        // チャンクリストに追加
+                        const chunkDiv = document.createElement('div');
+                        chunkDiv.style.padding = '5px';
+                        chunkDiv.style.marginBottom = '3px';
+                        chunkDiv.style.background = '#f8f9fa';
+                        chunkDiv.style.borderRadius = '4px';
+                        chunkDiv.style.fontSize = '13px';
+                        chunkDiv.textContent = `${processedChunks}. ${data.text} (${data.duration.toFixed(2)}秒)`;
+                        chunkList.appendChild(chunkDiv);
+                        chunkList.scrollTop = chunkList.scrollHeight;
+                        
+                        // 音声を再生
+                        try {
+                            await playAudioChunk(data.audio);
+                        } catch (e) {
+                            console.error('音声再生エラー:', e);
+                        }
+                    } else if (data.type === 'complete') {
+                        console.log('ストリーミング完了');
+                        progressText.textContent = '完了しました!';
+                        // 完了時は自動的にクリーンアップ
+                        if (eventSource) {
+                            eventSource.close();
+                            eventSource = null;
+                        }
+                        streamBtn.disabled = false;
+                        stopStreamBtn.disabled = true;
+                    } else if (data.type === 'error') {
+                        throw new Error(data.message);
+                    }
+                };
+                
+                eventSource.onerror = (error) => {
+                    console.error('EventSource エラー:', error);
+                    // データを受信していない場合のみエラー表示
+                    if (!hasReceivedData) {
+                        errorDiv.textContent = 'ストリーミング接続エラーが発生しました';
+                        errorDiv.classList.add('show');
+                    } else {
+                        console.log('ストリーミング終了（データ受信後）');
+                    }
+                    stopStreaming();
+                };
+                
+            } catch (error) {
+                console.error('ストリーミング開始エラー:', error);
+                errorDiv.textContent = `エラー: ${error.message}`;
+                errorDiv.classList.add('show');
+                stopStreaming();
+            }
+        });
+        
+        // ストリーミング停止ボタン
+        stopStreamBtn.addEventListener('click', stopStreaming);
     </script>
 </body>
 </html>
@@ -555,6 +738,121 @@ async def text_to_speech(request: TTSRequest):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/tts/streaming")
+async def text_to_speech_streaming(
+    text: str,
+    speaker: str = "Ono_Anna",
+    language: str = "Japanese",
+    max_chars: int = 50,
+    batch_size: int = 10
+):
+    """
+    テキストから音声をストリーミング生成するAPI
+    
+    Args:
+        text: 生成するテキスト
+        speaker: 話者名
+        language: 言語
+        max_chars: 最大文字数
+        batch_size: バッチサイズ
+    
+    Returns:
+        Server-Sent Events形式でチャンクごとの音声データ
+    """
+    print(f"🎵 ストリーミングリクエスト受信: {len(text)}文字, speaker={speaker}, lang={language}")
+    
+    async def generate_stream():
+        # ロック取得を試みる（既に他の処理中なら待機）
+        print("🔒 ロック取得を試みています...")
+        async with generation_lock:
+            print("✅ ロック取得成功、生成開始")
+            try:
+                # テキスト分割
+                chunks = split_text(text, max_chars=max_chars)
+                total_chunks = len(chunks)
+                print(f"📝 分割完了: {total_chunks}チャンク")
+                
+                # 初期情報を送信
+                init_data = {'type': 'init', 'total_chunks': total_chunks, 'sample_rate': 24000}
+                yield f"data: {json.dumps(init_data)}\n\n"
+                await asyncio.sleep(0.1)  # データをフラッシュ
+                
+                # バッチごとに処理
+                for i in range(0, total_chunks, batch_size):
+                    batch_chunks = chunks[i:i + batch_size]
+                    batch_num = i // batch_size + 1
+                    print(f"🎤 バッチ {batch_num} 生成中...")
+                    
+                    # バッチ生成
+                    wavs, sr = model.generate_custom_voice(
+                        text=batch_chunks,
+                        language=[language] * len(batch_chunks),
+                        speaker=[speaker] * len(batch_chunks),
+                    )
+                    print(f"✓ バッチ {batch_num} 生成完了")
+                    
+                    # 各チャンクを送信
+                    for j, wav in enumerate(wavs):
+                        chunk_idx = i + j
+                        duration = len(wav) / sr
+                        
+                        # チャンク間に0.5秒の無音を追加
+                        silence = np.zeros(int(sr * 0.5), dtype=wav.dtype)
+                        wav_with_silence = np.concatenate([wav, silence])
+                        
+                        # WAVファイルとしてエンコード
+                        buffer = io.BytesIO()
+                        sf.write(buffer, wav_with_silence, sr, format='WAV')
+                        audio_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                        
+                        # チャンクデータを送信
+                        chunk_data = {
+                            'type': 'chunk',
+                            'index': chunk_idx,
+                            'total': total_chunks,
+                            'text': batch_chunks[j],
+                            'duration': duration,
+                            'audio': audio_base64
+                        }
+                        yield f"data: {json.dumps(chunk_data)}\n\n"
+                        
+                        # データをフラッシュしてクライアント側の処理を待機
+                        await asyncio.sleep(0.1)
+                
+                # 完了通知
+                complete_data = {'type': 'complete'}
+                yield f"data: {json.dumps(complete_data)}\n\n"
+                print("✅ ストリーミング完了")
+                
+            except asyncio.CancelledError:
+                # クライアント切断時: リソースクリーンアップして静かに終了
+                print(f"⚠️  ストリーミング中断: クライアント切断を検知")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # CancelledErrorは再送出しない（接続終了を正常に処理）
+            except Exception as e:
+                print(f"❌ ストリーミングエラー: {e}")
+                import traceback
+                traceback.print_exc()
+                error_data = {'type': 'error', 'message': str(e)}
+                yield f"data: {json.dumps(error_data)}\n\n"
+            finally:
+                # 必ずGPUキャッシュをクリア
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print("🔓 ロック解放")
+    
+    return StreamingResponse(
+        generate_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
+
 
 
 @app.get("/health")
