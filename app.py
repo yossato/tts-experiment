@@ -41,7 +41,7 @@ class TTSStreamingRequest(BaseModel):
     speaker: str = "Ono_Anna"
     language: str = "Japanese"
     max_chars: int = 50
-    batch_size: int = 10
+    batch_size: int = 8
 
 
 # グローバル変数でモデルを保持
@@ -803,8 +803,8 @@ async def text_to_speech_streaming(
                         
                         # 文末タイプに応じて無音の長さを変える
                         if end_type == "period":
-                            # 句点: 0.5秒の無音
-                            silence_duration = 0.5
+                            # 句点・改行: 1秒の無音
+                            silence_duration = 1.0
                         else:
                             # 読点: 無音なし
                             silence_duration = 0.0

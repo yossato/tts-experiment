@@ -28,7 +28,7 @@ except ImportError:
 
 def split_text(text: str, max_chars: int = 50) -> List[tuple[str, str]]:
     """
-    テキストを句点・読点位置で分割
+    テキストを句点・読点・改行位置で分割
     
     Args:
         text: 分割するテキスト
@@ -36,10 +36,16 @@ def split_text(text: str, max_chars: int = 50) -> List[tuple[str, str]]:
     
     Returns:
         (テキスト, 文末タイプ)のリスト
-        文末タイプ: "period" (句点), "comma" (読点)
+        文末タイプ: "period" (句点・改行), "comma" (読点)
     """
-    # 句点（長い無音）と読点（短い無音）を区別
-    sentence_end_pattern = r'[。！？\.!?、,]'
+    # 全ての改行コード（\r\n, \r, \n）を統一
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    
+    # 連続する改行を1つにまとめる
+    text = re.sub(r'\n+', '\n', text)
+    
+    # 句点（長い無音）と読点（無音なし）を区別、改行も句点扱い
+    sentence_end_pattern = r'[。！？\.!?、,\n]'
     
     chunks = []
     current_chunk = ""
@@ -58,10 +64,20 @@ def split_text(text: str, max_chars: int = 50) -> List[tuple[str, str]]:
         if not sentence:
             continue
         
-        # 文末タイプを判定
+        # 文末タイプを判定（改行は句点と同じ扱い）
         end_type = "comma" if end_char in ['、', ','] else "period"
+        is_newline = end_char == '\n'
         
-        if len(current_chunk) + len(sentence) <= max_chars:
+        # 改行の場合は必ず区切る、それ以外はmax_charsで判定
+        if is_newline:
+            # 改行の場合は現在のチャンクを保存
+            if current_chunk:
+                chunks.append((current_chunk, "period"))
+            # 改行後の文も即座に保存（次の文と結合させない）
+            if sentence:
+                chunks.append((sentence, "period"))
+            current_chunk = ""
+        elif len(current_chunk) + len(sentence) <= max_chars:
             current_chunk += sentence
         else:
             if current_chunk:
@@ -235,13 +251,13 @@ class StreamingTTSGenerator:
                         print(f"▶️  チャンク {expected_chunk + 1} 再生中 ({duration:.2f}秒)...")
                         sd.play(wav, sr)
                         sd.wait()
-                        # チャンク間に0.5秒の無音を挿入（再生時）
-                        time.sleep(0.5)
+                        # チャンク間に1秒の無音を挿入（再生時）
+                        time.sleep(1.0)
                     
-                    # 保存用にバッファ（チャンク間に0.5秒の無音を追加）
+                    # 保存用にバッファ（チャンク間に1秒の無音を追加）
                     all_audios.append(wav)
-                    # 0.5秒分の無音を追加（サンプリングレート24kHz × 0.5秒）
-                    silence = np.zeros(int(sr * 0.5), dtype=wav.dtype)
+                    # 1秒分の無音を追加（サンプリングレート24kHz × 1秒）
+                    silence = np.zeros(int(sr * 1.0), dtype=wav.dtype)
                     all_audios.append(silence)
                     expected_chunk += 1
                 
@@ -319,8 +335,8 @@ class StreamingTTSGenerator:
             while not self.audio_queue.empty():
                 _, wav, sr = self.audio_queue.get()
                 all_audios.append(wav)
-                # チャンク間に0.5秒の無音を追加
-                silence = np.zeros(int(sr * 0.5), dtype=wav.dtype)
+                # チャンク間に1秒の無音を追加
+                silence = np.zeros(int(sr * 1.0), dtype=wav.dtype)
                 all_audios.append(silence)
             
             if save_path and all_audios:
