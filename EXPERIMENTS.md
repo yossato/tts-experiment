@@ -492,6 +492,240 @@ GPU処理は並列化できないため、複数リクエストの直列化が�
 
 ---
 
+## 実験7: MCP統合とmacOSクライアント実装（2026年2月14日夜）
+
+### 目標
+VS Code の Model Context Protocol (MCP) を使って、エディタから直接 TTS を呼び出せるようにする。
+
+### アーキテクチャ
+```
+VS Code (MCP Client)
+  ↓
+mcp_server.py (FastMCP)
+  ↓ subprocess
+tts_player.py (rumps - macOS Menu Bar App)
+  ↓ SSE Stream
+audio_library_server.py (FastAPI on Ubuntu GPU Server)
+  ↓ CUDA
+Qwen3-TTS-12Hz-1.7B-CustomVoice
+```
+
+### 実装内容
+
+#### 1. MCP Server (`mcp_server.py`)
+- **ツール**: `read_aloud`, `generate_audio`
+- FastMCP 1.26.0 を使用
+- `tts_player.py` をサブプロセスとして起動
+- デバッグログを `tts_player_debug.log` に出力
+
+#### 2. macOS Menu Bar Player (`tts_player.py`)
+- **フレームワーク**: rumps 0.4.0 (macOS専用)
+- **機能**:
+  - SSEストリームからチャンクをダウンロード
+  - メニューバーからPause/Resume/Stop
+  - リアルタイム速度変更（0.5x～2.0x）
+  - ピッチ保持（librosaのtime_stretch）
+- **再生方式**: sounddevice（ブロッキング再生）
+
+#### 3. サーバー側改善 (`audio_library_server.py`)
+- **問題**: TCP buffer saturation
+  - Base64エンコードした音声（~500KB）をSSEで送信
+  - 2チャンク目以降のyieldが55秒以上ブロック
+  - 原因: TCP送信バッファが満杯、クライアント側の受信が追いつかない
+- **解決策**: URL方式への移行
+  - 音声を一時ファイル（`temp_chunks/`）に保存
+  - SSEではメタデータ+URLのみ送信（数百バイト）
+  - クライアントは別HTTPリクエストでWAVをダウンロード
+  - 60秒後に自動クリーンアップ
+- **副次的効果**:
+  - イベントループのブロッキング解消
+  - Web UIのフリーズ解消
+  - マルチチャンクでも安定動作
+
+### 技術的課題と解決
+
+#### 課題1: UIスレッドの制約
+- **問題**: バックグラウンドスレッドから`self.title`を更新するとmacOSがクラッシュ
+- **解決**: タイマーベースのメインスレッド更新
+  ```python
+  self._ui_timer = rumps.Timer(self._update_title_on_main, 0.2)
+  ```
+
+#### 課題2: TCP Buffer Saturation
+- **現象**: 
+  - 1チャンク目: yield後2ms
+  - 2チャンク目: yield後55秒以上
+  - サーバーログで確認（`time.time()`タイムスタンプ）
+- **原因**: 
+  - Base64エンコード後の音声データ: ~500KB
+  - TCPバッファ: 通常64KB-256KB
+  - クライアント受信速度 < サーバー送信速度
+  - `yield`がバッファ空きを待って長時間ブロック
+- **試行錯誤**:
+  1. 64KB分割送信 → 効果なし（個別yieldも同様にブロック）
+  2. タイムアウト調整 → 根本解決にならず
+- **最終解決**: URL方式（上記）
+
+#### 課題3: 速度変更のタイミング
+- **初期実装**: ダウンロード時に速度変更適用
+  - 問題: ストリーミングでは先にダウンロードが進むため反映されない
+- **改善**: 再生時に速度変更適用
+  ```python
+  # _playback_worker内で
+  if self.playback_speed != 1.0:
+      audio = self._apply_speed_change(audio, self.sample_rate)
+  ```
+  - 結果: リアルタイムで速度変更が反映
+
+#### 課題4: ピッチ保持
+- **要件**: 速度変更時にピッチ（音程）は変えたくない
+- **解決**: librosa 0.11.0 の `time_stretch`
+  - Pitch-preserving time stretching
+  - rate = 2.0 で2倍速、rate = 0.5 で0.5倍速
+  - フォールバック: scipy の resample（ピッチも変わる）
+- **検証結果**: ピッチ変化なし、音質良好
+
+### パフォーマンス
+
+#### ストリーミング性能
+- **テストケース**: 18チャンクの長文（パラオ語の記事、約600文字）
+- **結果**:
+  - 1チャンク目生成完了後、即座に再生開始
+  - GPU生成中に並行して音声再生
+  - Web UIフリーズなし（`run_in_executor`による非ブロッキング化）
+  - 全チャンク正常配信・再生
+
+#### 速度変更性能
+- librosa `time_stretch`の処理時間: チャンクあたり約0.1-0.3秒
+- 再生には影響なし（前のチャンク再生中に処理）
+- メモリオーバーヘッド: 元の音声データ + 変換後データ（一時的）
+
+### ネットワーク最適化の考察
+
+#### Base64 vs URL方式の比較
+| 項目 | Base64 (旧) | URL方式 (新) |
+|------|-------------|--------------|
+| SSEペイロード | ~500KB | ~200バイト |
+| TCPバッファ圧迫 | あり（55秒ブロック） | なし |
+| HTTPリクエスト数 | 1 (SSE) | 2 (SSE + GET) |
+| サーバーディスク使用 | なし | 一時ファイル（60秒で削除） |
+| 実装複雑度 | 低 | 中 |
+| 推奨環境 | 単一チャンク | マルチチャンク |
+
+#### WebSocket vs SSE
+- **SSE選択理由**:
+  - 単方向通信で十分（サーバー→クライアント）
+  - HTTP/2サーバープッシュとの親和性
+  - 自動再接続機能
+  - シンプルな実装
+- **WebSocket検討余地**:
+  - バイナリ配信でBase64オーバーヘッド削減
+  - 双方向制御（速度変更指示など）
+
+### 完成した機能
+
+#### クライアント機能
+- ✅ ストリーミング再生（生成中に再生開始）
+- ✅ マルチチャンク対応（18チャンク検証済み）
+- ✅ Pause/Resume（再生中断・再開）
+- ✅ Stop（完全停止）
+- ✅ リアルタイム速度変更（0.5x～2.0x）
+- ✅ ピッチ保持（librosa time_stretch）
+- ✅ メニューバー常駐
+- ✅ 日本語・英語対応
+
+#### サーバー機能
+- ✅ URL方式による安定配信
+- ✅ 一時ファイルの自動クリーンアップ
+- ✅ run_in_executorによる非ブロッキングGPU推論
+- ✅ generation_lockのスコープ最適化
+- ✅ Web UIフリーズ解消
+
+### 既知の制約・課題
+
+#### Web UI「Streaming」ボタンの制約
+**現状**: 
+- Web UIの「Streaming」ボタンは、SSEで生成進捗を受け取り進行状況を表示するが、**音声の再生は行わない**
+- 音声はライブラリに保存され、完了後にユーザーが手動で再生する必要がある
+
+**動作フロー**:
+1. テキスト入力 → 「Streaming」ボタンクリック
+2. SSE経由で生成進捗を受信（`init` → `chunk` → `complete`）
+3. 進捗バーにチャンク数と進捗率を表示
+4. 完了後、ライブラリに保存（自動リロード）
+5. **音声再生は行われない** → ライブラリ一覧から手動再生が必要
+
+**制約理由**:
+- `generateStreaming()`関数は進捗表示のみ実装
+- 音声チャンクのダウンロード・デコード・再生処理が未実装
+- Web Audio APIを使ったプログレッシブ再生は複雑度が高い
+
+**改善案**:
+1. **案1: ストリーミング再生の実装（本格的）**
+   - Web Audio APIでチャンクごとに再生
+   - `tts_player.py`のmacOSクライアントと同等の体験
+   - 実装複雑度: 高（AudioContext、AudioBuffer管理、タイミング制御）
+   
+2. **案2: 生成完了後の自動再生（シンプル）**
+   - `complete`イベント受信後、最新ライブラリエントリを自動再生
+   - 実装複雑度: 低（既存のplayAudio関数を呼ぶだけ）
+   - デメリット: 生成完了まで音声が聞こえない
+
+**現状の推奨ワークフロー**:
+- **リアルタイム再生が必要な場合**: MCP統合版（`tts_player.py`）を使用
+- **バッチ生成の場合**: Web UIの「Generate」ボタン → ライブラリから再生
+- **進捗確認が必要な場合**: Web UIの「Streaming」ボタン → 完了後に手動再生
+
+### デバッグ手法
+
+#### ログベース診断
+```python
+# タイムスタンプ付きログで遅延を可視化
+print(f"[{time.time():.3f}] Chunk {i} yielded", file=sys.stderr, flush=True)
+```
+- 結果: yieldから次のログまで55秒→TCP buffer blocking判明
+
+#### ネットワークトレース
+```bash
+# クライアント側
+curl -v http://192.168.1.99:8001/api/generate/streaming?...
+
+# 接続確認
+ping -c 3 192.168.1.99
+```
+
+#### プロセス管理
+```bash
+# 残存プロセスの確認
+ps aux | grep tts_player
+
+# クリーンアップ
+pkill -f tts_player.py
+```
+
+### 学んだこと
+
+#### 1. TCPバッファの限界
+- ストリーミングでも、データサイズが大きいとyieldがブロックする
+- 解決策: ペイロードを小さくする（メタデータのみ）+ 別リクエストで本体取得
+
+#### 2. GUIスレッドの制約
+- macOSのUIフレームワークは厳格なスレッド制約あり
+- バックグラウンドスレッドからのUI更新は必ずクラッシュ
+- メインスレッドのタイマーで間接的に更新
+
+#### 3. 速度変更の実装位置
+- ダウンロード時 vs 再生時
+- ストリーミングでは「再生時」でないとリアルタイム反映されない
+- 先読みバッファリングでは、ダウンロード済みチャンクは変更不可
+
+#### 4. ピッチ保持の重要性
+- 単純なリサンプリング（scipy.signal.resample）はピッチも変わる
+- librosaのtime_stretchはフェーズボコーダーベースでピッチ保持
+- 音質と処理速度のトレードオフあり（今回は問題なし）
+
+---
+
 ## 参考文献
 
 - Qwen3-TTS Technical Report: https://arxiv.org/abs/2601.15621
@@ -499,3 +733,7 @@ GPU処理は並列化できないため、複数リクエストの直列化が�
 - PyTorch CUDA Best Practices: https://pytorch.org/docs/stable/notes/cuda.html
 - Server-Sent Events (SSE): https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events
 - Web Audio API: https://developer.mozilla.org/en-US/docs/Web/API/Web_Audio_API
+- Model Context Protocol (MCP): https://spec.modelcontextprotocol.io/
+- FastMCP: https://github.com/jlowin/fastmcp
+- rumps (Ridiculously Uncomplicated macOS Python Statusbar apps): https://github.com/jaredks/rumps
+- librosa Audio Analysis: https://librosa.org/doc/latest/index.html
