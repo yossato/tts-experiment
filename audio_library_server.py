@@ -455,6 +455,7 @@ body {
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-primary { background: #0071e3; color: white; }
 .btn-stream { background: #30d158; color: white; }
+.btn-stop { background: #ff9500; color: white; display: none; }
 .btn-danger { background: #ff3b30; color: white; font-size: 13px; padding: 6px 14px; }
 .btn-row { display: flex; gap: 10px; }
 
@@ -583,7 +584,8 @@ body {
         </div>
         <div class="btn-row">
             <button class="btn btn-primary" onclick="generateNormal()">Generate</button>
-            <button class="btn btn-stream" onclick="generateStreaming()">Streaming</button>
+            <button class="btn btn-stream" id="btnStream" onclick="generateStreaming()">Streaming</button>
+            <button class="btn btn-stop" id="btnStop" onclick="stopStreaming()">Stop</button>
         </div>
         <div class="progress-bar" id="progress"><div class="fill" id="progressFill"></div></div>
         <div class="status-text" id="status"></div>
@@ -684,13 +686,34 @@ async function generateNormal() {
     }
 }
 
+let streamingState = null;
+
+function stopStreaming() {
+    if (!streamingState) return;
+    if (streamingState.evtSource) streamingState.evtSource.close();
+    streamingState.sources.forEach(s => { try { s.stop(); } catch(e) {} });
+    if (streamingState.audioCtx) streamingState.audioCtx.close();
+    streamingState = null;
+    document.getElementById('btnStop').style.display = 'none';
+    const btns = document.querySelectorAll('.btn');
+    btns.forEach(b => b.disabled = false);
+    setProgress(0, 'Stopped');
+    setTimeout(() => showProgress(false), 2000);
+}
+
 async function generateStreaming() {
     const text = document.getElementById('text').value.trim();
     if (!text) return;
     const btns = document.querySelectorAll('.btn');
     btns.forEach(b => b.disabled = true);
+    document.getElementById('btnStop').style.display = 'inline-block';
+    document.getElementById('btnStop').disabled = false;
     showProgress(true);
     setProgress(0, 'Connecting...');
+
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    let nextStartTime = 0;
+    streamingState = { audioCtx, sources: [], evtSource: null };
 
     const params = new URLSearchParams({
         text,
@@ -699,32 +722,66 @@ async function generateStreaming() {
         language: document.getElementById('language').value,
     });
 
+    async function playChunk(url) {
+        const res = await fetch(url);
+        const buf = await res.arrayBuffer();
+        const audioBuf = await audioCtx.decodeAudioData(buf);
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuf;
+        source.connect(audioCtx.destination);
+        if (nextStartTime < audioCtx.currentTime) {
+            nextStartTime = audioCtx.currentTime;
+        }
+        source.start(nextStartTime);
+        streamingState.sources.push(source);
+        nextStartTime += audioBuf.duration;
+    }
+
     const evtSource = new EventSource(API + '/api/generate/streaming?' + params);
+    streamingState.evtSource = evtSource;
     evtSource.onmessage = function(event) {
         const data = JSON.parse(event.data);
         if (data.type === 'init') {
             setProgress(5, 'Generating 0/' + data.total_chunks + ' chunks...');
         } else if (data.type === 'chunk') {
             const pct = Math.round(((data.index + 1) / data.total) * 100);
-            setProgress(pct, 'Generating ' + (data.index+1) + '/' + data.total + ' chunks...');
+            setProgress(pct, 'Playing ' + (data.index+1) + '/' + data.total + ' chunks...');
+            playChunk(data.audio_url);
         } else if (data.type === 'complete') {
-            setProgress(100, 'Done!');
+            setProgress(100, 'Playing...');
             evtSource.close();
             document.getElementById('text').value = '';
             document.getElementById('title').value = '';
             loadLibrary();
-            btns.forEach(b => b.disabled = false);
-            setTimeout(() => showProgress(false), 3000);
+            // 再生完了まで待ってからUIをリセット
+            const remaining = nextStartTime - audioCtx.currentTime;
+            const waitMs = Math.max(remaining * 1000, 0) + 500;
+            setTimeout(() => {
+                document.getElementById('btnStop').style.display = 'none';
+                btns.forEach(b => b.disabled = false);
+                setProgress(100, 'Done!');
+                setTimeout(() => showProgress(false), 2000);
+                if (streamingState && streamingState.audioCtx === audioCtx) {
+                    audioCtx.close();
+                    streamingState = null;
+                }
+            }, waitMs);
         } else if (data.type === 'error') {
             setProgress(0, 'Error: ' + data.message);
             evtSource.close();
+            document.getElementById('btnStop').style.display = 'none';
             btns.forEach(b => b.disabled = false);
+            audioCtx.close();
+            streamingState = null;
         }
     };
     evtSource.onerror = function() {
         setProgress(0, 'Connection error');
         evtSource.close();
+        document.getElementById('btnStop').style.display = 'none';
         btns.forEach(b => b.disabled = false);
+        audioCtx.close();
+        streamingState = null;
     };
 }
 
