@@ -147,18 +147,73 @@ generator.generate_and_play(
 )
 ```
 
+### 4. MCP統合版（VS Code + macOSメニューバー）
+
+**構成:**
+```
+VS Code (MCP Client)
+  ↓
+mcp_server.py (FastMCP)
+  ↓ subprocess
+tts_player.py (rumps - macOS Menu Bar App)
+  ↓ SSE Stream
+audio_library_server.py (FastAPI on Ubuntu GPU Server)
+```
+
+**サーバー起動（Ubuntu）:**
+```bash
+./run_library_server.sh
+```
+
+**VS Code MCP設定（`~/.config/Code/User/mcp.json`）:**
+```json
+{
+  "mcpServers": {
+    "tts": {
+      "command": "/path/to/venv/bin/python",
+      "args": ["/path/to/mcp_server.py"],
+      "env": {
+        "TTS_SERVER_URL": "http://192.168.1.99:8001"
+      }
+    }
+  }
+}
+```
+
+**機能:**
+- ✅ VS Code GitHub Copilotから直接TTS呼び出し
+- ✅ macOSメニューバー常駐プレイヤー
+- ✅ ストリーミング再生（生成中に再生開始）
+- ✅ Pause/Resume/Stop制御
+- ✅ リアルタイム速度変更（0.5x～2.0x）
+- ✅ ピッチ保持（音程は変わらない）
+- ✅ マルチチャンク対応（18チャンク検証済み）
+
+**使い方:**
+1. VS Code で GitHub Copilot Chat を開く
+2. `@tts` を入力してツールを呼び出す
+3. テキストを入力
+4. メニューバーにTTSアイコンが表示され、音声が再生される
+5. メニューから速度変更・Pause/Resume/Stopが可能
+
 ## 📁 ファイル構成
 
 ```
 .
-├── simple_batch_tts.py      # シンプルバッチ処理版
-├── streaming_tts.py         # ストリーミング風生成＆再生版
-├── app.py                   # FastAPI Webサーバー
-├── api_client.py            # APIクライアントサンプル
-├── run_server.sh            # サーバー起動スクリプト
-├── requirements.txt         # Python依存パッケージ
-├── .gitignore              # Git除外設定
-└── Qwen3-TTS/              # Qwen3-TTS サブモジュール
+├── simple_batch_tts.py         # シンプルバッチ処理版
+├── streaming_tts.py            # ストリーミング風生成＆再生版
+├── app.py                      # FastAPI Webサーバー（基本版）
+├── audio_library_server.py     # FastAPI Webサーバー（MCP統合版）
+├── mcp_server.py               # MCP Server（FastMCP）
+├── tts_player.py               # macOSメニューバープレイヤー（rumps）
+├── api_client.py               # APIクライアントサンプル
+├── run_server.sh               # サーバー起動スクリプト（基本版）
+├── run_library_server.sh       # サーバー起動スクリプト（MCP統合版）
+├── requirements.txt            # Python依存パッケージ
+├── EXPERIMENTS.md              # 実験ログ・技術詳細
+├── SETUP.md                    # セットアップガイド
+├── .gitignore                  # Git除外設定
+└── Qwen3-TTS/                  # Qwen3-TTS サブモジュール
 ```
 
 ## 🧪 実験結果
@@ -211,6 +266,28 @@ Qwen3-TTSモデル自体はストリーミングをサポート（97msレイテ�
 - `non_streaming_mode=False` は「シミュレート」のみ
 - 真のストリーミングはDashScope API（商用）またはvLLM-Omni（今後対応）で可能
 
+### 5. TCP Buffer Saturationの回避
+SSEで大きなデータ（Base64エンコード音声 ~500KB）を送信すると、TCPバッファが満杯になり`yield`が長時間ブロックする。
+- **問題**: 2チャンク目以降のyieldが55秒以上ブロック
+- **解決**: 音声を一時ファイルに保存し、SSEではURL（数百バイト）のみ送信
+- **効果**: Web UIフリーズ解消、マルチチャンク安定配信
+
+### 6. GUIスレッド制約への対処
+macOSのUIフレームワーク（rumps）ではバックグラウンドスレッドからのUI更新は禁止。
+- **問題**: `self.title`をバックグラウンドスレッドから更新するとクラッシュ
+- **解決**: メインスレッドのタイマー（0.2秒間隔）で間接的に更新
+- **実装**: `_pending_title`変数 + `rumps.Timer`
+
+### 7. 速度変更のタイミング
+ストリーミングではダウンロードが再生より先に進むため、速度変更は「再生時」に適用する必要がある。
+- **ダウンロード時適用**: 先読みバッファのため変更が反映されない
+- **再生時適用**: リアルタイムで速度変更が反映
+
+### 8. ピッチ保持の実装
+librosaの`time_stretch`（フェーズボコーダーベース）を使用することで、速度変更時にピッチ（音程）を保持。
+- **scipy.signal.resample**: 速度変更できるがピッチも変わる
+- **librosa.effects.time_stretch**: ピッチ保持で速度変更（推奨）
+
 ## 🔧 トラブルシューティング
 
 ### CUDA Out of Memory エラー
@@ -236,6 +313,17 @@ You are attempting to use Flash Attention 2 without specifying a torch dtype.
 ```
 → 警告のみで動作に問題なし。bfloat16で正しく動作している。
 
+### Web UIの「Streaming」ボタンで音声が聞こえない
+**現状の動作**:
+- 「Streaming」ボタンは生成進捗をリアルタイム表示するが、音声の自動再生は行わない
+- 音声はライブラリに保存され、完了後に手動で再生する必要がある
+
+**回避策**:
+- **方法1**: 生成完了後、ライブラリ一覧から手動で再生
+- **方法2**: リアルタイム再生が必要な場合は、MCP統合版（`tts_player.py`）を使用
+
+詳細は[EXPERIMENTS.md](EXPERIMENTS.md#既知の制約課題)を参照。
+
 ## 📝 今後の展望
 
 - [ ] vLLM-Omni統合（真のストリーミング対応）
@@ -243,6 +331,7 @@ You are attempting to use Flash Attention 2 without specifying a torch dtype.
 - [ ] 複数GPUサポート
 - [ ] 音声品質の詳細評価
 - [ ] 他言語での性能検証
+- [ ] Web UIストリーミング再生機能の実装
 
 ## 📚 参考資料
 
@@ -250,6 +339,11 @@ You are attempting to use Flash Attention 2 without specifying a torch dtype.
 - [Qwen3-TTS技術ブログ](https://qwen.ai/blog?id=qwen3tts-0115)
 - [Qwen3-TTS論文](https://arxiv.org/abs/2601.15621)
 - [vLLM-Omni](https://docs.vllm.ai/projects/vllm-omni/en/latest/)
+- [Model Context Protocol (MCP)](https://spec.modelcontextprotocol.io/)
+- [FastMCP](https://github.com/jlowin/fastmcp)
+- [rumps - macOS Menu Bar Apps](https://github.com/jaredks/rumps)
+- [librosa - Audio Analysis](https://librosa.org/doc/latest/index.html)
+- [Server-Sent Events (SSE)](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
 
 ## 📄 ライセンス
 

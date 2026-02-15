@@ -38,6 +38,19 @@ except ImportError:
     print("Error: httpx is required. Install with: pip install httpx")
     sys.exit(1)
 
+# Optional: librosa for high-quality time stretching
+try:
+    import librosa
+    HAS_LIBROSA = True
+except ImportError:
+    HAS_LIBROSA = False
+    # Fallback to scipy for simple resampling
+    try:
+        from scipy import signal
+        HAS_SCIPY = True
+    except ImportError:
+        HAS_SCIPY = False
+
 
 class TTSPlayerApp(rumps.App):
     def __init__(self, server_url: str, text: str, speaker: str = "Ono_Anna",
@@ -60,6 +73,7 @@ class TTSPlayerApp(rumps.App):
         # 再生状態
         self.is_paused = False
         self.is_stopped = False
+        self.playback_speed = 1.0  # 再生速度 (0.5 - 2.0)
         self.audio_queue: list[np.ndarray] = []
         self.queue_lock = threading.Lock()
         self.current_chunk = 0
@@ -72,33 +86,66 @@ class TTSPlayerApp(rumps.App):
         self.current_audio: np.ndarray | None = None
         self.playback_event = threading.Event()
 
+        # メインスレッドUI更新用（バックグラウンドスレッドから直接self.titleを変更するとクラッシュする）
+        self._pending_title: str | None = None
+        self._title_lock = threading.Lock()
+
         # メニュー構成
         self.text_item = rumps.MenuItem(display_text, callback=None)
         self.text_item.set_callback(None)
         self.pause_item = rumps.MenuItem("Pause", callback=self.toggle_pause)
         self.stop_item = rumps.MenuItem("Stop", callback=self.stop_playback)
-        self.menu = [self.text_item, None, self.pause_item, self.stop_item]
+        
+        # 速度選択サブメニュー
+        speed_menu = [
+            rumps.MenuItem("0.5x", callback=lambda _: self.set_speed(0.5)),
+            rumps.MenuItem("0.75x", callback=lambda _: self.set_speed(0.75)),
+            rumps.MenuItem("1.0x (Normal)", callback=lambda _: self.set_speed(1.0)),
+            rumps.MenuItem("1.25x", callback=lambda _: self.set_speed(1.25)),
+            rumps.MenuItem("1.5x", callback=lambda _: self.set_speed(1.5)),
+            rumps.MenuItem("2.0x", callback=lambda _: self.set_speed(2.0)),
+        ]
+        self.speed_item = rumps.MenuItem("Speed", callback=None)
+        for item in speed_menu:
+            self.speed_item.add(item)
+        
+        self.menu = [self.text_item, None, self.pause_item, self.stop_item, None, self.speed_item]
 
-    def ready(self):
-        """アプリ起動後にSSE受信・再生スレッドを開始"""
+        # SSE受信・再生スレッドを__init__で開始（ready()はサブプロセスから呼ばれない場合がある）
+        self.sse_done = threading.Event()
+        print(f"[DEBUG] Starting SSE thread...", file=sys.stderr, flush=True)
         self.sse_thread = threading.Thread(target=self._sse_worker, daemon=True)
+        print(f"[DEBUG] Starting playback thread...", file=sys.stderr, flush=True)
         self.play_thread = threading.Thread(target=self._playback_worker, daemon=True)
         self.sse_thread.start()
         self.play_thread.start()
+        print(f"[DEBUG] Threads started", file=sys.stderr, flush=True)
+
+        # メインスレッドでタイトルを更新するタイマー（0.2秒間隔）
+        self._ui_timer = rumps.Timer(self._update_title_on_main, 0.2)
+        self._ui_timer.start()
+
+    def _set_title_safe(self, new_title: str):
+        """スレッドセーフにタイトルを設定（メインスレッドのタイマーが反映）"""
+        with self._title_lock:
+            self._pending_title = new_title
+
+    def _update_title_on_main(self, _):
+        """メインスレッドで呼ばれるタイマーコールバック"""
+        with self._title_lock:
+            if self._pending_title is not None:
+                self.title = self._pending_title
+                self._pending_title = None
 
     def toggle_pause(self, _):
         if self.is_paused:
             self.is_paused = False
             self.pause_item.title = "Pause"
-            self.title = f"TTS {self.current_chunk}/{self.total_chunks}"
-            if self.stream:
-                self.stream.start()
+            self._set_title_safe(f"TTS {self.current_chunk}/{self.total_chunks}")
         else:
             self.is_paused = True
             self.pause_item.title = "Resume"
-            self.title = "TTS (paused)"
-            if self.stream:
-                self.stream.stop()
+            self._set_title_safe("TTS (paused)")
 
     def stop_playback(self, _):
         self.is_stopped = True
@@ -106,9 +153,16 @@ class TTSPlayerApp(rumps.App):
             self.stream.stop()
             self.stream.close()
             self.stream = None
-        self.title = "TTS (stopped)"
+        self._set_title_safe("TTS (stopped)")
         # 少し待ってからアプリ終了
         threading.Timer(1.0, self._quit).start()
+
+    def set_speed(self, speed: float):
+        """再生速度を設定"""
+        self.playback_speed = speed
+        print(f"[DEBUG] Playback speed set to {speed}x", file=sys.stderr, flush=True)
+        if not self.is_paused and not self.is_stopped:
+            self._set_title_safe(f"TTS {self.current_chunk}/{self.total_chunks} ({speed}x)")
 
     def _quit(self):
         rumps.quit_application()
@@ -123,80 +177,221 @@ class TTSPlayerApp(rumps.App):
             "save": str(self.save).lower(),
         })
         url = f"{self.server_url}/api/generate/streaming?{params}"
+        print(f"[DEBUG] Connecting to: {url}", file=sys.stderr, flush=True)
 
         try:
-            with httpx.Client(timeout=None) as client:
+            # タイムアウト設定: 接続30秒、読み取り無制限
+            with httpx.Client(timeout=httpx.Timeout(30.0, read=None)) as client:
+                print(f"[DEBUG] Opening SSE stream...", file=sys.stderr, flush=True)
                 with client.stream("GET", url) as response:
+                    print(f"[DEBUG] Stream opened, status: {response.status_code}", file=sys.stderr, flush=True)
                     buffer = ""
+                    chunk_count = 0
                     for chunk in response.iter_text():
                         if self.is_stopped:
+                            print(f"[DEBUG] Stopped by user", file=sys.stderr, flush=True)
                             return
                         buffer += chunk
                         while "\n\n" in buffer:
                             message, buffer = buffer.split("\n\n", 1)
                             for line in message.strip().split("\n"):
                                 if line.startswith("data: "):
+                                    chunk_count += 1
+                                    print(f"[DEBUG] Received chunk #{chunk_count}", file=sys.stderr, flush=True)
                                     data = json.loads(line[6:])
                                     self._handle_sse(data)
         except Exception as e:
-            print(f"SSE error: {e}", file=sys.stderr)
-            self.title = "TTS (error)"
-            threading.Timer(3.0, self._quit).start()
+            print(f"[ERROR] SSE error: {e}", file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            self._set_title_safe("TTS (error)")
+            threading.Timer(1.0, self._quit).start()
+            return
+        finally:
+            print(f"[DEBUG] SSE stream closed", file=sys.stderr, flush=True)
+            self.sse_done.set()
 
     def _handle_sse(self, data: dict):
-        if data["type"] == "init":
+        event_type = data.get('type')
+        print(f"[DEBUG] SSE event: {event_type}", file=sys.stderr, flush=True)
+        if event_type == "init":
             self.total_chunks = data["total_chunks"]
             self.sample_rate = data.get("sample_rate", 24000)
-            rumps.notification("TTS Player", "", f"Generating {self.total_chunks} chunks...")
-        elif data["type"] == "chunk":
-            # Base64 WAVをデコード
-            audio_bytes = base64.b64decode(data["audio"])
+            self._set_title_safe(f"TTS 0/{self.total_chunks}")
+            print(f"[DEBUG] Init: {self.total_chunks} chunks, sample_rate: {self.sample_rate}", file=sys.stderr, flush=True)
+        elif event_type == "chunk":
+            if "audio" in data:
+                # 旧形式: audioフィールドが直接含まれる（後方互換）
+                self._decode_and_queue_b64(data["audio"], data["index"])
+            elif "audio_url" in data:
+                # 新形式: URLから音声をダウンロード
+                audio_url = self.server_url + data["audio_url"]
+                idx = data["index"]
+                print(f"[DEBUG] Downloading chunk {idx} from {audio_url}", file=sys.stderr, flush=True)
+                try:
+                    resp = httpx.get(audio_url, timeout=30.0)
+                    resp.raise_for_status()
+                    audio_data, sr = sf.read(io.BytesIO(resp.content), dtype="float32")
+                    print(f"[DEBUG] Downloaded chunk {idx}: {len(resp.content)} bytes -> shape {audio_data.shape}", file=sys.stderr, flush=True)
+                    
+                    with self.queue_lock:
+                        self.audio_queue.append(audio_data)
+                    self.playback_event.set()
+                    self.current_chunk = idx + 1
+                    speed_suffix = f" ({self.playback_speed}x)" if self.playback_speed != 1.0 else ""
+                    self._set_title_safe(f"TTS {self.current_chunk}/{self.total_chunks}{speed_suffix}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to download chunk {idx}: {e}", file=sys.stderr, flush=True)
+        elif event_type == "complete":
+            print(f"[DEBUG] Stream complete", file=sys.stderr, flush=True)
+            self.sse_done.set()
+        elif event_type == "error":
+            print(f"[ERROR] Server error: {data['message']}", file=sys.stderr, flush=True)
+            self._set_title_safe("TTS (error)")
+            threading.Timer(1.0, self._quit).start()
+
+    def _decode_and_queue_b64(self, audio_b64: str, index: int):
+        """Base64音声データをデコードしてキューに追加（後方互換）"""
+        try:
+            audio_bytes = base64.b64decode(audio_b64)
             audio_data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+            print(f"[DEBUG] Decoded audio: {len(audio_bytes)} bytes -> shape {audio_data.shape}, sr={sr}", file=sys.stderr, flush=True)
+            
             with self.queue_lock:
                 self.audio_queue.append(audio_data)
-            self.playback_event.set()  # 再生スレッドに通知
-            self.current_chunk = data["index"] + 1
-            self.title = f"TTS {self.current_chunk}/{self.total_chunks}"
-        elif data["type"] == "complete":
-            pass  # 再生完了は playback_worker が処理
-        elif data["type"] == "error":
-            print(f"Server error: {data['message']}", file=sys.stderr)
-            self.title = "TTS (error)"
-            threading.Timer(3.0, self._quit).start()
+            self.playback_event.set()
+            self.current_chunk = index + 1
+            speed_suffix = f" ({self.playback_speed}x)" if self.playback_speed != 1.0 else ""
+            self._set_title_safe(f"TTS {self.current_chunk}/{self.total_chunks}{speed_suffix}")
+        except Exception as e:
+            print(f"[ERROR] Failed to decode audio: {e}", file=sys.stderr, flush=True)
+
+    def _apply_speed_change(self, audio_data: np.ndarray, sr: int) -> np.ndarray:
+        """音声データに速度変更を適用"""
+        if self.playback_speed == 1.0:
+            return audio_data
+        
+        rate = self.playback_speed
+        
+        # librosaがあればpitch-preserving time stretchを使用（高品質）
+        if HAS_LIBROSA:
+            try:
+                # librosa.effects.time_stretchはrate > 1で高速化、rate < 1で低速化
+                return librosa.effects.time_stretch(audio_data, rate=rate)
+            except Exception as e:
+                print(f"[WARN] librosa time_stretch failed: {e}, falling back to resampling", file=sys.stderr, flush=True)
+        
+        # scipyでシンプルなリサンプリング（pitchも変わる）
+        if HAS_SCIPY:
+            try:
+                from scipy import signal
+                new_length = int(len(audio_data) / rate)
+                return signal.resample(audio_data, new_length)
+            except Exception as e:
+                print(f"[WARN] scipy resample failed: {e}, using original audio", file=sys.stderr, flush=True)
+        
+        # どちらもなければ元のまま
+        print(f"[WARN] No speed change library available, using original audio", file=sys.stderr, flush=True)
+        return audio_data
 
     def _playback_worker(self):
-        """キューから音声を取り出して順番に再生"""
+        """キューから音声を取り出して順番に再生（ストリーミング）"""
+        print(f"[DEBUG] Playback worker started", file=sys.stderr, flush=True)
         played = 0
+        
+        def callback(outdata, frames, time_info, status):
+            """sounddeviceのコールバック - 再生データを供給"""
+            if status:
+                print(f"[DEBUG] Playback status: {status}", file=sys.stderr, flush=True)
+            
+            # Pause中はサイレンスを出力
+            if self.is_paused:
+                outdata[:] = 0
+                return
+            
+            # 現在の音声データがない、または再生位置が終端に達した場合
+            if self.current_audio is None or self.play_position >= len(self.current_audio):
+                outdata[:] = 0
+                return
+            
+            # 残りのサンプル数を計算
+            remaining = len(self.current_audio) - self.play_position
+            to_read = min(frames, remaining)
+            
+            # データをコピー
+            outdata[:to_read] = self.current_audio[self.play_position:self.play_position + to_read].reshape(-1, 1)
+            if to_read < frames:
+                outdata[to_read:] = 0
+            
+            self.play_position += to_read
+        
+        # OutputStreamを開始
+        try:
+            self.stream = sd.OutputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                callback=callback,
+                blocksize=2048
+            )
+            self.stream.start()
+        except Exception as e:
+            print(f"[ERROR] Failed to open audio stream: {e}", file=sys.stderr, flush=True)
+            return
+        
         while not self.is_stopped:
-            self.playback_event.wait(timeout=1.0)
+            self.playback_event.wait(timeout=0.5)
             self.playback_event.clear()
 
             while not self.is_stopped:
+                # 新しいチャンクがあるか確認
                 with self.queue_lock:
                     if played >= len(self.audio_queue):
                         break
                     audio = self.audio_queue[played]
 
-                # ブロッキング再生
+                # チャンクを設定して再生開始
                 try:
-                    sd.play(audio, samplerate=self.sample_rate)
-                    # 一時停止対応のためポーリングで待機
-                    while sd.get_stream().active:
-                        if self.is_stopped:
-                            sd.stop()
-                            return
-                        time.sleep(0.05)
-                    sd.wait()
+                    # 速度変更を再生時に適用
+                    if self.playback_speed != 1.0:
+                        audio = self._apply_speed_change(audio, self.sample_rate)
+                        print(f"[DEBUG] Applied speed {self.playback_speed}x to chunk #{played + 1}, new shape: {audio.shape}", file=sys.stderr, flush=True)
+                    
+                    print(f"[DEBUG] Playing chunk #{played + 1}, shape: {audio.shape}", file=sys.stderr, flush=True)
+                    self.current_audio = audio
+                    self.play_position = 0
+                    
+                    # 再生完了まで待機（Pause/Stop対応）
+                    while self.play_position < len(self.current_audio) and not self.is_stopped:
+                        if not self.is_paused:
+                            # 再生中は短い間隔でチェック
+                            time.sleep(0.1)
+                        else:
+                            # Pause中は少し長めに
+                            time.sleep(0.2)
+                    
+                    if self.is_stopped:
+                        print(f"[DEBUG] Playback stopped", file=sys.stderr, flush=True)
+                        if self.stream:
+                            self.stream.stop()
+                            self.stream.close()
+                        return
+                    
+                    print(f"[DEBUG] Chunk #{played + 1} finished", file=sys.stderr, flush=True)
                 except Exception as e:
-                    print(f"Playback error: {e}", file=sys.stderr)
+                    print(f"[ERROR] Playback error: {e}", file=sys.stderr, flush=True)
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
 
                 played += 1
 
-            # 全チャンク受信済みかつ再生完了なら終了
-            if self.total_chunks > 0 and played >= self.total_chunks:
-                self.title = "TTS (done)"
-                rumps.notification("TTS Player", "", "Playback complete")
-                threading.Timer(3.0, self._quit).start()
+            # SSE完了済み かつ 全チャンク再生完了なら自動終了
+            if self.sse_done.is_set() and played >= len(self.audio_queue):
+                print(f"[DEBUG] All chunks played, exiting", file=sys.stderr, flush=True)
+                self._set_title_safe("TTS (done)")
+                if self.stream:
+                    self.stream.stop()
+                    self.stream.close()
+                threading.Timer(1.0, self._quit).start()
                 return
 
 
@@ -210,15 +405,27 @@ def main():
     parser.add_argument("--no-save", action="store_true", help="Don't save to library")
     args = parser.parse_args()
 
-    app = TTSPlayerApp(
-        server_url=args.server,
-        text=args.text,
-        speaker=args.speaker,
-        language=args.language,
-        title=args.title,
-        save=not args.no_save,
-    )
-    app.run()
+    print(f"[DEBUG] Starting TTS Player", file=sys.stderr, flush=True)
+    print(f"[DEBUG] Server: {args.server}", file=sys.stderr, flush=True)
+    print(f"[DEBUG] Text: {args.text[:50]}...", file=sys.stderr, flush=True)
+    print(f"[DEBUG] Speaker: {args.speaker}, Language: {args.language}", file=sys.stderr, flush=True)
+
+    try:
+        app = TTSPlayerApp(
+            server_url=args.server,
+            text=args.text,
+            speaker=args.speaker,
+            language=args.language,
+            title=args.title,
+            save=not args.no_save,
+        )
+        print(f"[DEBUG] App created, starting run loop", file=sys.stderr, flush=True)
+        app.run()
+    except Exception as e:
+        print(f"[ERROR] Fatal error: {e}", file=sys.stderr, flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
