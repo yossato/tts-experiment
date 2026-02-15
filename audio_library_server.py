@@ -121,13 +121,18 @@ async def generate(request: GenerateRequest):
 
             start_time = time.time()
             all_wavs = []
+            loop = asyncio.get_event_loop()
 
             for i in range(0, len(chunks), request.batch_size):
                 batch = chunks[i:i + request.batch_size]
-                wavs, sr = model.generate_custom_voice(
-                    text=batch,
-                    language=[request.language] * len(batch),
-                    speaker=[request.speaker] * len(batch),
+                wavs, sr = await loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        model.generate_custom_voice,
+                        text=batch,
+                        language=[request.language] * len(batch),
+                        speaker=[request.speaker] * len(batch),
+                    )
                 )
                 # 文末タイプに応じた無音を追加
                 for j, wav in enumerate(wavs):
