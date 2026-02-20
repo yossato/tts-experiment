@@ -48,8 +48,16 @@ class GenerateRequest(BaseModel):
     title: Optional[str] = None
     speaker: str = "Ono_Anna"
     language: str = "Japanese"
+
+
+class StreamingRequest(BaseModel):
+    text: str
+    title: Optional[str] = None
+    speaker: str = "Ono_Anna"
+    language: str = "Japanese"
     max_chars: int = 50
     batch_size: int = 8
+    save: bool = True
 
 
 # --- ライブラリ管理 ---
@@ -116,33 +124,19 @@ async def generate(request: GenerateRequest):
     """音声生成 → ライブラリに保存 → WAV返却"""
     async with generation_lock:
         try:
-            chunks_with_type = split_text(request.text, max_chars=request.max_chars)
-            chunks = [t for t, _ in chunks_with_type]
-
             start_time = time.time()
-            all_wavs = []
             loop = asyncio.get_event_loop()
 
-            for i in range(0, len(chunks), request.batch_size):
-                batch = chunks[i:i + request.batch_size]
-                wavs, sr = await loop.run_in_executor(
-                    None,
-                    functools.partial(
-                        model.generate_custom_voice,
-                        text=batch,
-                        language=[request.language] * len(batch),
-                        speaker=[request.speaker] * len(batch),
-                    )
+            wavs, sr = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    model.generate_custom_voice,
+                    text=[request.text],
+                    language=[request.language],
+                    speaker=[request.speaker],
                 )
-                # 文末タイプに応じた無音を追加
-                for j, wav in enumerate(wavs):
-                    _, end_type = chunks_with_type[i + j]
-                    if end_type == "period":
-                        silence = np.zeros(int(sr * 1.0), dtype=wav.dtype)
-                        wav = np.concatenate([wav, silence])
-                    all_wavs.append(wav)
-
-            combined = np.concatenate(all_wavs)
+            )
+            combined = wavs[0]
             gen_time = time.time() - start_time
             duration = len(combined) / sr
 
@@ -181,19 +175,13 @@ async def generate(request: GenerateRequest):
             raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/generate/streaming")
+@app.post("/api/generate/streaming")
 async def generate_streaming(
     request: Request,
-    text: str,
-    title: Optional[str] = None,
-    speaker: str = "Ono_Anna",
-    language: str = "Japanese",
-    max_chars: int = 50,
-    batch_size: int = 8,
-    save: bool = True,
+    body: StreamingRequest,
 ):
     """SSEストリーミング生成 → ライブラリに保存"""
-    entry_id = str(uuid.uuid4())[:8] if save else None
+    entry_id = str(uuid.uuid4())[:8] if body.save else None
 
     # ストリーム用の一時ディレクトリ
     stream_id = str(uuid.uuid4())[:8]
@@ -203,7 +191,7 @@ async def generate_streaming(
     async def generate_stream():
         try:
             disconnected = False
-            chunks_with_type = split_text(text, max_chars=max_chars)
+            chunks_with_type = split_text(body.text, max_chars=body.max_chars)
             total_chunks = len(chunks_with_type)
 
             init_data = {"type": "init", "total_chunks": total_chunks, "sample_rate": SAMPLE_RATE}
@@ -213,7 +201,7 @@ async def generate_streaming(
 
             all_wavs = []
 
-            for i in range(0, total_chunks, batch_size):
+            for i in range(0, total_chunks, body.batch_size):
                 is_disc = await request.is_disconnected()
                 print(f"[DEBUG] Batch {i}, is_disconnected={is_disc}")
                 if is_disc:
@@ -221,7 +209,7 @@ async def generate_streaming(
                     disconnected = True
                     break
 
-                batch_chunks = chunks_with_type[i:i + batch_size]
+                batch_chunks = chunks_with_type[i:i + body.batch_size]
                 batch_texts = [t for t, _ in batch_chunks]
 
                 t0 = datetime.now()
@@ -233,8 +221,8 @@ async def generate_streaming(
                         functools.partial(
                             model.generate_custom_voice,
                             text=batch_texts,
-                            language=[language] * len(batch_texts),
-                            speaker=[speaker] * len(batch_texts),
+                            language=[body.language] * len(batch_texts),
+                            speaker=[body.speaker] * len(batch_texts),
                         )
                     )
                 t1 = datetime.now()
@@ -257,7 +245,7 @@ async def generate_streaming(
                     else:
                         wav_with_silence = wav
 
-                    if save:
+                    if body.save:
                         all_wavs.append(wav_with_silence)
 
                     # 一時ファイルとして保存
@@ -285,16 +273,16 @@ async def generate_streaming(
                     break
 
             # ライブラリに保存
-            if save and all_wavs and not disconnected:
+            if body.save and all_wavs and not disconnected:
                 combined = np.concatenate(all_wavs)
                 total_duration = len(combined) / sr
                 save_audio(entry_id, combined, sr)
                 add_entry({
                     "id": entry_id,
-                    "title": title or text[:50],
-                    "text": text,
-                    "speaker": speaker,
-                    "language": language,
+                    "title": body.title or body.text[:50],
+                    "text": body.text,
+                    "speaker": body.speaker,
+                    "language": body.language,
                     "duration": round(total_duration, 1),
                     "created_at": datetime.now().isoformat(),
                 })
@@ -695,7 +683,7 @@ let streamingState = null;
 
 function stopStreaming() {
     if (!streamingState) return;
-    if (streamingState.evtSource) streamingState.evtSource.close();
+    if (streamingState.controller) streamingState.controller.abort();
     streamingState.sources.forEach(s => { try { s.stop(); } catch(e) {} });
     if (streamingState.audioCtx) streamingState.audioCtx.close();
     streamingState = null;
@@ -718,14 +706,23 @@ async function generateStreaming() {
 
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     let nextStartTime = 0;
-    streamingState = { audioCtx, sources: [], evtSource: null };
+    const controller = new AbortController();
+    streamingState = { audioCtx, sources: [], controller };
 
-    const params = new URLSearchParams({
-        text,
-        title: document.getElementById('title').value || '',
-        speaker: document.getElementById('speaker').value,
-        language: document.getElementById('language').value,
-    });
+    const pendingChunks = [];
+    let isPlayingChunk = false;
+    let queueDoneResolve = null;
+
+    async function processChunkQueue() {
+        if (isPlayingChunk || pendingChunks.length === 0) return;
+        isPlayingChunk = true;
+        while (pendingChunks.length > 0) {
+            const url = pendingChunks.shift();
+            await playChunk(url);
+        }
+        isPlayingChunk = false;
+        if (queueDoneResolve) { queueDoneResolve(); queueDoneResolve = null; }
+    }
 
     async function playChunk(url) {
         const res = await fetch(url);
@@ -734,60 +731,86 @@ async function generateStreaming() {
         const source = audioCtx.createBufferSource();
         source.buffer = audioBuf;
         source.connect(audioCtx.destination);
-        if (nextStartTime < audioCtx.currentTime) {
-            nextStartTime = audioCtx.currentTime;
-        }
+        if (nextStartTime < audioCtx.currentTime) nextStartTime = audioCtx.currentTime;
         source.start(nextStartTime);
-        streamingState.sources.push(source);
+        if (streamingState) streamingState.sources.push(source);
         nextStartTime += audioBuf.duration;
     }
 
-    const evtSource = new EventSource(API + '/api/generate/streaming?' + params);
-    streamingState.evtSource = evtSource;
-    evtSource.onmessage = function(event) {
-        const data = JSON.parse(event.data);
-        if (data.type === 'init') {
-            setProgress(5, 'Generating 0/' + data.total_chunks + ' chunks...');
-        } else if (data.type === 'chunk') {
-            const pct = Math.round(((data.index + 1) / data.total) * 100);
-            setProgress(pct, 'Playing ' + (data.index+1) + '/' + data.total + ' chunks...');
-            playChunk(data.audio_url);
-        } else if (data.type === 'complete') {
-            setProgress(100, 'Playing...');
-            evtSource.close();
-            document.getElementById('text').value = '';
-            document.getElementById('title').value = '';
-            loadLibrary();
-            // 再生完了まで待ってからUIをリセット
-            const remaining = nextStartTime - audioCtx.currentTime;
-            const waitMs = Math.max(remaining * 1000, 0) + 500;
-            setTimeout(() => {
-                document.getElementById('btnStop').style.display = 'none';
-                btns.forEach(b => b.disabled = false);
-                setProgress(100, 'Done!');
-                setTimeout(() => showProgress(false), 2000);
-                if (streamingState && streamingState.audioCtx === audioCtx) {
-                    audioCtx.close();
-                    streamingState = null;
+    function waitForQueueDrain() {
+        if (!isPlayingChunk && pendingChunks.length === 0) return Promise.resolve();
+        return new Promise(resolve => { queueDoneResolve = resolve; });
+    }
+
+    try {
+        const response = await fetch(API + '/api/generate/streaming', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify({
+                text,
+                title: document.getElementById('title').value || null,
+                speaker: document.getElementById('speaker').value,
+                language: document.getElementById('language').value,
+            }),
+        });
+
+        if (!response.ok) throw new Error(await response.text());
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                let data;
+                try { data = JSON.parse(line.slice(6)); } catch(e) { continue; }
+                if (data.type === 'init') {
+                    setProgress(5, 'Generating 0/' + data.total_chunks + ' chunks...');
+                } else if (data.type === 'chunk') {
+                    const pct = Math.round(((data.index + 1) / data.total) * 100);
+                    setProgress(pct, 'Playing ' + (data.index+1) + '/' + data.total + ' chunks...');
+                    pendingChunks.push(data.audio_url);
+                    processChunkQueue();
+                } else if (data.type === 'complete') {
+                    setProgress(100, 'Playing...');
+                    document.getElementById('text').value = '';
+                    document.getElementById('title').value = '';
+                    loadLibrary();
+                    // キューの全チャンクが fetch/decode されてから待機時間を計算
+                    await waitForQueueDrain();
+                    const remaining = nextStartTime - audioCtx.currentTime;
+                    const waitMs = Math.max(remaining * 1000, 0) + 500;
+                    setTimeout(() => {
+                        if (streamingState && streamingState.audioCtx === audioCtx) {
+                            audioCtx.close();
+                            streamingState = null;
+                        }
+                        setProgress(100, 'Done!');
+                        document.getElementById('btnStop').style.display = 'none';
+                        btns.forEach(b => b.disabled = false);
+                        setTimeout(() => showProgress(false), 2000);
+                    }, waitMs);
+                } else if (data.type === 'error') {
+                    throw new Error(data.message);
                 }
-            }, waitMs);
-        } else if (data.type === 'error') {
-            setProgress(0, 'Error: ' + data.message);
-            evtSource.close();
-            document.getElementById('btnStop').style.display = 'none';
-            btns.forEach(b => b.disabled = false);
-            audioCtx.close();
-            streamingState = null;
+            }
         }
-    };
-    evtSource.onerror = function() {
-        setProgress(0, 'Connection error');
-        evtSource.close();
+    } catch(e) {
+        if (e.name !== 'AbortError') setProgress(0, 'Error: ' + e.message);
+        else setProgress(0, 'Stopped');
+        audioCtx.close();
+        if (streamingState && streamingState.audioCtx === audioCtx) streamingState = null;
         document.getElementById('btnStop').style.display = 'none';
         btns.forEach(b => b.disabled = false);
-        audioCtx.close();
-        streamingState = null;
-    };
+        setTimeout(() => showProgress(false), 2000);
+    }
 }
 
 async function deleteEntry(id) {
